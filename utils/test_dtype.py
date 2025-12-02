@@ -20,8 +20,8 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 # Import quantization functions
-from quant.hifp import quant_hif8
-from quant.mxfp import _quantize_mx
+from fake_quant_ops.quant.hifp import quant_hif8
+from fake_quant_ops.quant.mxfp import _quantize_mx
 
 
 def analyze_quantization_error(original: torch.Tensor, quantized: torch.Tensor, method_name: str):

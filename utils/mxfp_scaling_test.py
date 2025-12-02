@@ -17,7 +17,7 @@ from datetime import datetime
 # Add the parent directory to path to import mxfp module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from quant.mxfp import _quantize_mx, _get_format_params, ElemFormat,_remove_scaling_mx
+from fake_quant_ops.quant.mxfp import _quantize_mx, _get_format_params, ElemFormat,_remove_scaling_mx
 
 def setup_logging(output_dir, tensor_name, elem_format):
     """
@@ -679,7 +679,7 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
     A = A / scale_factor
     
     # Quantize element-wise
-    from quant.mxfp import _quantize_elemwise_core,_analyze_overflow_underflow_before_quantization
+    from fake_quant_ops.quant.mxfp import _quantize_elemwise_core,_analyze_overflow_underflow_before_quantization
     
     # Analyze overflow/underflow without printing (collect results)
     overflow_underflow_analysis = _analyze_overflow_underflow_before_quantization(
