@@ -1,5 +1,5 @@
 import numpy as np
-from fake_quant_ops.quant.qtype import QType
+from qtype import QType
 from torch import Tensor
 import torch
 from torch.autograd import Function
@@ -154,7 +154,7 @@ def quant_hif8(x: Tensor, Q: QType=None, qdim: int=-1) -> Tensor:
     eps = torch.finfo(torch.float32).eps
     scale = torch.tensor(K, dtype=torch.float32, device=x.device) / (amax + eps)
     x = x.float() * scale
-    x_qdq = quant_hif8_core(x, qtype, force_py=False).to(torch.bfloat16)
+    x_qdq = quant_hif8_core(x, qtype).to(torch.bfloat16)
     out = ((x + (x_qdq - x).detach()) / scale).to(torch.bfloat16)
     return out
 
@@ -227,3 +227,4 @@ if __name__ == "__main__":
     loss_hif = torch.mean((C_bf16 - C_hifp8) ** 2)
         
     print(f"C_shape:{C_hifp8.shape},output_max:{torch.max(C_hifp8)},output_min:{torch.min(C_hifp8)}")
+    print(f"loss_hifp: {loss_hif}")

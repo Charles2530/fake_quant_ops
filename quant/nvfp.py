@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor
 from torch.autograd import Function
+from typing import Optional, Dict, Union
 import re
 
 FP32_EXPONENT_BIAS = 127
@@ -9,37 +10,57 @@ FP32_MIN_NORMAL = 2 ** (-FP32_EXPONENT_BIAS + 1)
 
 def _get_nvfp_params(nvfp_format: str):
     """
-    Get NVFP format parameters
+    Get NVFP format parameters and corresponding PyTorch dtype
+    
+    Supported formats:
+    - 'nvfp4' or 'nvfp4_e2m1': 4-bit, E2M1 format
+    - 'nvfp8_e4m3': 8-bit, E4M3 format (default for nvfp8)
+    - 'nvfp8_e5m2': 8-bit, E5M2 format
+    
     Args:
-        nvfp_format: 'nvfp2', 'nvfp4', 'nvfp8', etc.
+        nvfp_format: NVFP format string
     Returns:
         ebits: exponent bits
         mbits: mantissa bits (including sign)
         emax: max exponent
         max_norm: max representable value
+        torch_dtype: Corresponding PyTorch dtype (if available)
     """
-    res = re.match(r"^nvfp([0-9]+)$", nvfp_format.lower())
-    if res is None:
-        raise ValueError(f"Invalid NVFP format: {nvfp_format}. Expected nvfp2, nvfp4, nvfp8, etc.")
+    nvfp_format_lower = nvfp_format.lower()
     
-    n_bits = int(res.group(1))
-    
-    if n_bits == 2:
-        ebits, mbits = 0, 2  # 2-bit: 0 exp, 1 mantissa + 1 sign
-        emax = 0
-        max_norm = 1.0  # 2^0 * (2^1 - 1) / 2^0 = 1.0
-    elif n_bits == 4:
+    # Parse format string
+    if nvfp_format_lower == 'nvfp4' or nvfp_format_lower == 'nvfp4_e2m1':
         ebits, mbits = 2, 3  # 4-bit: 2 exp, 1 mantissa + 1 sign
         emax = 2**(ebits - 1)  # 2
         max_norm = 2**emax * float(2**(mbits-1) - 1) / 2**(mbits-2)  # 2^2 * 1.0 = 4.0
-    elif n_bits == 8:
+        torch_dtype = None  # No direct PyTorch dtype for FP4
+    elif nvfp_format_lower == 'nvfp8' or nvfp_format_lower == 'nvfp8_e4m3':
         ebits, mbits = 4, 5  # 8-bit: 4 exp, 3 mantissa + 1 sign
         emax = 2**(ebits - 1)  # 8
-        max_norm = 2**emax * 1.75  # Similar to fp8_e4m3
+        max_norm = 448.0  # FP8 E4M3 max value
+        torch_dtype = torch.float8_e4m3fn
+    elif nvfp_format_lower == 'nvfp8_e5m2':
+        ebits, mbits = 5, 4  # 8-bit: 5 exp, 2 mantissa + 1 sign
+        emax = 2**(ebits - 1) - 1  # 15
+        max_norm = 57344.0  # FP8 E5M2 max value
+        torch_dtype = torch.float8_e5m2
     else:
-        raise ValueError(f"NVFP{n_bits} not supported. Only nvfp2, nvfp4, nvfp8 are supported.")
+        # Try to parse old format for backward compatibility
+        res = re.match(r"^nvfp([0-9]+)$", nvfp_format_lower)
+        if res is None:
+            raise ValueError(
+                f"Invalid NVFP format: {nvfp_format}. "
+                f"Expected nvfp4, nvfp4_e2m1, nvfp8, nvfp8_e4m3, or nvfp8_e5m2"
+            )
+        n_bits = int(res.group(1))
+        if n_bits == 4:
+            return _get_nvfp_params('nvfp4')
+        elif n_bits == 8:
+            return _get_nvfp_params('nvfp8_e4m3')  # Default to E4M3
+        else:
+            raise ValueError(f"NVFP{n_bits} not supported. Only nvfp4 and nvfp8 are supported.")
     
-    return ebits, mbits, emax, max_norm
+    return ebits, mbits, emax, max_norm, torch_dtype
 
 
 def _round_mantissa(A, bits, round='nearest'):
@@ -57,56 +78,113 @@ def _round_mantissa(A, bits, round='nearest'):
     return A
 
 
-def _quantize_elemwise_nvfp(A, ebits, mbits, max_norm, round='nearest'):
+def _quantize_nvfp_with_torch_dtype(x: Tensor, torch_dtype, max_norm: float, amax: Optional[Tensor] = None):
     """
-    Element-wise quantization for NVFP format
+    Quantize using PyTorch's native FP8 types (for NVFP8 E4M3/E5M2)
+    
+    This uses per-tensor scaling: compute amax, scale, convert to FP8, convert back.
+    
     Args:
-        A: Input tensor
-        ebits: exponent bits
-        mbits: mantissa bits (including sign)
-        max_norm: max representable value
-        round: rounding method
+        x: Input tensor
+        torch_dtype: torch.float8_e4m3fn or torch.float8_e5m2
+        max_norm: Maximum representable value
+        amax: Optional pre-computed amax (for static quantization)
     Returns:
-        Quantized tensor
+        Quantized and dequantized tensor
     """
-    A_is_sparse = A.is_sparse
-    if A_is_sparse:
-        if A.layout != torch.sparse_coo:
-            raise NotImplementedError("Only COO layout sparse tensors are currently supported.")
-        sparse_A = A.coalesce()
-        A = sparse_A.values().clone()
+    eps = torch.finfo(torch.float32).eps
     
-    out = A.clone()
-    
-    # Handle zero
-    zero_mask = (A == 0)
-    
-    if ebits != 0:
-        # Calculate private exponent for each element
-        abs_A = torch.abs(A)
-        private_exp = torch.floor(torch.log2(
-            abs_A + FP32_MIN_NORMAL * zero_mask.type(A.dtype)
-        ))
-        
-        # Clip exponent range
-        min_exp = -(2**(ebits-1)) + 2
-        private_exp = private_exp.clamp(min=min_exp)
-        
-        # Scale up to integer portion
-        scale_up = 2**(mbits - 2)
-        out = out / (2**private_exp) * scale_up
-        
-        # Round mantissa
-        out = _round_mantissa(out, mbits, round)
-        
-        # Scale back
-        out = out / scale_up * (2**private_exp)
+    # Compute or use provided amax
+    if amax is not None:
+        if isinstance(amax, (int, float)):
+            amax_val = float(amax)
+        elif isinstance(amax, torch.Tensor):
+            amax_val = amax.item() if amax.numel() == 1 else amax
+        else:
+            amax_val = float(amax)
     else:
-        # For ebits=0 (nvfp2), treat as fixed-point
-        scale_up = 2**(mbits - 1)
-        out = out * scale_up
-        out = _round_mantissa(out, mbits, round)
-        out = out / scale_up
+        # Dynamic: compute per-tensor amax
+        amax_val = torch.amax(torch.abs(x)).item()
+    
+    if amax_val < eps:
+        return x.clone()
+    
+    # Compute scale: scale so that amax maps to max_norm
+    scale = max_norm / (amax_val + eps)
+    
+    # Scale input
+    x_scaled = x.float() * scale
+    
+    # Convert to FP8 and back (this performs the quantization)
+    x_fp8 = x_scaled.to(torch_dtype)
+    x_dequantized = x_fp8.float() / scale
+    
+    return x_dequantized
+
+
+def _quantize_nvfp4_manual(x: Tensor, max_norm: float, amax: Optional[Tensor] = None):
+    """
+    Manual quantization for NVFP4 (E2M1) since PyTorch doesn't have native FP4 type
+    
+    Args:
+        x: Input tensor
+        max_norm: Maximum representable value (4.0 for E2M1)
+        amax: Optional pre-computed amax (for static quantization)
+    Returns:
+        Quantized and dequantized tensor
+    """
+    eps = torch.finfo(torch.float32).eps
+    ebits, mbits = 2, 3  # E2M1: 2 exp, 1 mantissa + 1 sign
+    
+    # Compute or use provided amax
+    if amax is not None:
+        if isinstance(amax, (int, float)):
+            amax_val = float(amax)
+        elif isinstance(amax, torch.Tensor):
+            amax_val = amax.item() if amax.numel() == 1 else amax
+        else:
+            amax_val = float(amax)
+    else:
+        # Dynamic: compute per-tensor amax
+        amax_val = torch.amax(torch.abs(x)).item()
+    
+    if amax_val < eps:
+        return x.clone()
+    
+    # Compute scale
+    scale = max_norm / (amax_val + eps)
+    
+    # Scale input
+    x_scaled = x.float() * scale
+    
+    # Manual quantization for E2M1
+    out = x_scaled.clone()
+    zero_mask = (x_scaled == 0)
+    abs_x = torch.abs(x_scaled)
+    non_zero_mask = ~zero_mask
+    
+    # Calculate private exponent for each element
+    private_exp = torch.zeros_like(abs_x)
+    private_exp[non_zero_mask] = torch.floor(torch.log2(abs_x[non_zero_mask] + FP32_MIN_NORMAL))
+    
+    # Clip exponent range
+    min_exp = -(2**(ebits-1)) + 1  # -1
+    max_exp = 2**(ebits-1)  # 2
+    private_exp = private_exp.clamp(min=min_exp, max=max_exp)
+    
+    # Scale up to integer portion
+    scale_up = 2**(mbits - 1)  # 2^2 = 4
+    out = torch.where(non_zero_mask,
+                     out / (2**private_exp) * scale_up,
+                     torch.zeros_like(out))
+    
+    # Round mantissa
+    out = _round_mantissa(out, mbits, 'nearest')
+    
+    # Scale back
+    out = torch.where(non_zero_mask,
+                     out / scale_up * (2**private_exp),
+                     torch.zeros_like(out))
     
     # Clamp to max_norm
     out = torch.clamp(out, min=-max_norm, max=max_norm)
@@ -115,62 +193,91 @@ def _quantize_elemwise_nvfp(A, ebits, mbits, max_norm, round='nearest'):
     out = torch.where(zero_mask, torch.zeros_like(out), out)
     
     # Handle Inf/NaN
-    out = torch.where(torch.isinf(A) | torch.isnan(A), A, out)
+    out = torch.where(torch.isinf(x_scaled) | torch.isnan(x_scaled), x_scaled, out)
     
-    if A_is_sparse:
-        out = torch.sparse_coo_tensor(
-            sparse_A.indices(), out,
-            sparse_A.size(), dtype=sparse_A.dtype,
-            device=sparse_A.device, requires_grad=sparse_A.requires_grad
-        )
+    # Scale back to original range
+    out = out / scale
     
     return out
 
 
 @torch.no_grad()
-def quant_nvfp_core(x: Tensor, nvfp_format: str = 'nvfp4', round: str = 'nearest') -> Tensor:
+def quant_nvfp_core(
+    x: Tensor, 
+    nvfp_format: str = 'nvfp4', 
+    round: str = 'nearest',
+    amax: Optional[Tensor] = None,
+    scale: Optional[Tensor] = None
+) -> Tensor:
     """
-    Core NVFP quantization function (per-tensor)
+    Core NVFP quantization function (per-tensor scaling)
+    
+    NVFP uses per-tensor scaling: compute amax for entire tensor, then scale and quantize.
+    For NVFP8, uses PyTorch's native FP8 types (float8_e4m3fn or float8_e5m2).
+    For NVFP4, uses manual quantization since PyTorch doesn't have native FP4.
+    
+    Supports both dynamic and static quantization:
+    - Dynamic: amax is computed from input tensor
+    - Static: amax is provided (from calibration data)
+    
     Args:
         x: Input tensor
-        nvfp_format: 'nvfp2', 'nvfp4', 'nvfp8'
-        round: Rounding method ('nearest', 'floor', 'even')
+        nvfp_format: 'nvfp4', 'nvfp4_e2m1', 'nvfp8', 'nvfp8_e4m3', 'nvfp8_e5m2'
+        round: Rounding method (only used for manual quantization, ignored for FP8)
+        amax: Optional pre-computed amax value for static quantization
+        scale: Optional pre-computed scale value (if provided, amax is ignored)
     Returns:
-        Quantized tensor
+        Quantized and dequantized tensor
     """
-    ebits, mbits, emax, max_norm = _get_nvfp_params(nvfp_format)
+    # Handle empty tensor
+    if x.numel() == 0:
+        return x.clone()
     
-    # Per-tensor scaling: find max absolute value
-    amax = torch.amax(torch.abs(x))
-    eps = torch.finfo(torch.float32).eps
+    # Get format parameters
+    ebits, mbits, emax, max_norm, torch_dtype = _get_nvfp_params(nvfp_format)
     
-    # Calculate scale factor to fit into max_norm range
-    scale = max_norm / (amax + eps)
+    # If scale is provided, compute amax from it
+    if scale is not None:
+        eps = torch.finfo(torch.float32).eps
+        if isinstance(scale, torch.Tensor):
+            scale_val = scale.item() if scale.numel() == 1 else scale
+        else:
+            scale_val = float(scale)
+        amax = torch.tensor(max_norm / scale_val - eps, device=x.device, dtype=x.dtype)
     
-    # Scale input
-    x_scaled = x.float() * scale
-    
-    # Quantize
-    x_quantized = _quantize_elemwise_nvfp(x_scaled, ebits, mbits, max_norm, round)
-    
-    # Scale back
-    x_dequantized = x_quantized / scale
-    
-    return x_dequantized
+    # Use PyTorch native FP8 types for NVFP8
+    if torch_dtype is not None:
+        return _quantize_nvfp_with_torch_dtype(x, torch_dtype, max_norm, amax)
+    else:
+        # Manual quantization for NVFP4
+        return _quantize_nvfp4_manual(x, max_norm, amax)
 
 
-def quant_nvfp(x: Tensor, nvfp_format: str = 'nvfp4', round: str = 'nearest') -> Tensor:
+def quant_nvfp(
+    x: Tensor, 
+    nvfp_format: str = 'nvfp4', 
+    round: str = 'nearest',
+    amax: Optional[Tensor] = None,
+    scale: Optional[Tensor] = None
+) -> Tensor:
     """
     NVFP quantization with gradient support (per-tensor)
+    
+    Supports both dynamic and static quantization:
+    - Dynamic: amax and scale are computed from input tensor (default)
+    - Static: amax or scale is provided (from calibration data)
+    
     Args:
         x: Input tensor
         nvfp_format: 'nvfp2', 'nvfp4', 'nvfp8'
         round: Rounding method
+        amax: Optional pre-computed amax value for static quantization
+        scale: Optional pre-computed scale value for static quantization
     Returns:
         Quantized tensor with gradient flow
     """
     x_temp = x.clone()
-    x_quantized = quant_nvfp_core(x_temp.detach(), nvfp_format, round)
+    x_quantized = quant_nvfp_core(x_temp.detach(), nvfp_format, round, amax, scale)
     
     # Straight-through estimator: preserve gradients
     out = x + (x_quantized - x.detach())
@@ -234,44 +341,208 @@ def nvfp_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0, nvfp_format='nvfp4'
     return NVFPBAddBmm.apply(input, batch1, batch2, beta, alpha, nvfp_format)
 
 
-def quant_dequant_qkv(q, k, v, nvfp_format='nvfp4'):
-    """Quantize QKV tensors with NVFP"""
-    q_temp, k_temp, v_temp = q.clone(), k.clone(), v.clone()
-    q_temp = quant_nvfp(q_temp.detach(), nvfp_format)
-    k_temp = quant_nvfp(k_temp.detach(), nvfp_format)
-    v_temp = quant_nvfp(v_temp.detach(), nvfp_format)
+def quant_dequant_qkv(
+    q, k, v, 
+    nvfp_format='nvfp4',
+    q_amax: Optional[Tensor] = None,
+    q_scale: Optional[Tensor] = None,
+    k_amax: Optional[Tensor] = None,
+    k_scale: Optional[Tensor] = None,
+    v_amax: Optional[Tensor] = None,
+    v_scale: Optional[Tensor] = None
+):
+    """
+    Quantize QKV tensors with NVFP
     
-    final_q = q + (q_temp - q.detach())
-    final_k = k + (k_temp - k.detach())
-    final_v = v + (v_temp - v.detach())
+    Supports both dynamic and static quantization.
+    For static quantization, provide amax or scale for each tensor (q, k, v).
+    
+    Args:
+        q, k, v: Input QKV tensors
+        nvfp_format: 'nvfp2', 'nvfp4', 'nvfp8'
+        q_amax, k_amax, v_amax: Optional pre-computed amax values for static quantization
+        q_scale, k_scale, v_scale: Optional pre-computed scale values for static quantization
+    Returns:
+        Quantized QKV tensors with gradient flow
+    """
+    # quant_nvfp already handles straight-through estimator, so we can use it directly
+    final_q = quant_nvfp(q, nvfp_format, amax=q_amax, scale=q_scale)
+    final_k = quant_nvfp(k, nvfp_format, amax=k_amax, scale=k_scale)
+    final_v = quant_nvfp(v, nvfp_format, amax=v_amax, scale=v_scale)
     return final_q, final_k, final_v
 
 
-def quant_dequant_tensor(tensor, nvfp_format='nvfp4'):
-    """Quantize a tensor with NVFP"""
-    tensor_temp = tensor.clone()
-    tensor_temp = quant_nvfp(tensor_temp.detach(), nvfp_format)
-    final_tensor = tensor + (tensor_temp - tensor.detach())
-    return final_tensor
+def quant_dequant_tensor(
+    tensor, 
+    nvfp_format='nvfp4',
+    amax: Optional[Tensor] = None,
+    scale: Optional[Tensor] = None
+):
+    """
+    Quantize a tensor with NVFP
+    
+    Supports both dynamic and static quantization.
+    
+    Args:
+        tensor: Input tensor
+        nvfp_format: 'nvfp2', 'nvfp4', 'nvfp8'
+        amax: Optional pre-computed amax value for static quantization
+        scale: Optional pre-computed scale value for static quantization
+    Returns:
+        Quantized tensor with gradient flow
+    """
+    # quant_nvfp already handles straight-through estimator, so we can use it directly
+    return quant_nvfp(tensor, nvfp_format, amax=amax, scale=scale)
+
+
+def compute_amax_from_calibration(
+    x: Tensor,
+    calibration_amax: Optional[Union[float, Tensor]] = None
+) -> Tensor:
+    """
+    Compute amax for static quantization.
+    
+    If calibration_amax is provided, use it; otherwise compute dynamically.
+    This function helps bridge calibration data to quantization.
+    
+    Args:
+        x: Input tensor
+        calibration_amax: Optional pre-computed amax from calibration data
+    Returns:
+        amax value (scalar tensor)
+    """
+    if calibration_amax is not None:
+        if isinstance(calibration_amax, (int, float)):
+            return torch.tensor(calibration_amax, device=x.device, dtype=x.dtype)
+        elif isinstance(calibration_amax, torch.Tensor):
+            return calibration_amax.to(device=x.device, dtype=x.dtype)
+        else:
+            return torch.tensor(float(calibration_amax), device=x.device, dtype=x.dtype)
+    else:
+        # Dynamic: compute from input
+        return torch.amax(torch.abs(x))
+
+
+def compute_scale_from_amax(
+    amax: Tensor,
+    nvfp_format: str = 'nvfp4',
+    eps: Optional[float] = None
+) -> Tensor:
+    """
+    Compute scale from amax for NVFP quantization.
+    
+    This is useful for static quantization where amax is known from calibration.
+    
+    Args:
+        amax: Maximum absolute value (amax)
+        nvfp_format: 'nvfp4', 'nvfp4_e2m1', 'nvfp8', 'nvfp8_e4m3', 'nvfp8_e5m2'
+        eps: Optional epsilon value (default: torch.finfo(torch.float32).eps)
+    Returns:
+        Scale value (scalar tensor)
+    """
+    _, _, _, max_norm, _ = _get_nvfp_params(nvfp_format)
+    if eps is None:
+        eps = torch.finfo(torch.float32).eps
+    
+    if isinstance(amax, (int, float)):
+        amax = torch.tensor(amax, dtype=torch.float32)
+    elif isinstance(amax, torch.Tensor):
+        amax = amax.float()
+    
+    scale = max_norm / (amax + eps)
+    return scale
+
+
+class NVFPStaticQuantConfig:
+    """
+    Configuration for static NVFP quantization.
+    
+    Stores calibration data (amax values) for each tensor/layer.
+    This can be loaded from calibration files generated by calibration scripts.
+    """
+    
+    def __init__(self, calibration_data: Optional[Dict[str, Union[float, Tensor]]] = None):
+        """
+        Initialize static quantization config.
+        
+        Args:
+            calibration_data: Dictionary mapping tensor names to their amax values.
+                             Keys should be in format like "layer.weight_amax" or "layer.activation_amax"
+        """
+        self.calibration_data = calibration_data or {}
+    
+    def get_amax(self, tensor_name: str) -> Optional[Union[float, Tensor]]:
+        """
+        Get amax value for a tensor by name.
+        
+        Args:
+            tensor_name: Name of the tensor (e.g., "layer.weight_amax")
+        Returns:
+            amax value if found, None otherwise
+        """
+        return self.calibration_data.get(tensor_name)
+    
+    def set_amax(self, tensor_name: str, amax: Union[float, Tensor]):
+        """
+        Set amax value for a tensor.
+        
+        Args:
+            tensor_name: Name of the tensor
+            amax: amax value to store
+        """
+        self.calibration_data[tensor_name] = amax
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Union[float, list]]) -> 'NVFPStaticQuantConfig':
+        """
+        Create config from dictionary (e.g., loaded from JSON).
+        
+        Args:
+            data: Dictionary with tensor names as keys and amax values (or lists) as values
+        Returns:
+            NVFPStaticQuantConfig instance
+        """
+        calibration_data = {}
+        for key, value in data.items():
+            if isinstance(value, list):
+                # Convert list to tensor
+                calibration_data[key] = torch.tensor(value, dtype=torch.float32)
+            elif isinstance(value, (int, float)):
+                calibration_data[key] = float(value)
+            else:
+                calibration_data[key] = value
+        return cls(calibration_data)
+    
+    def to_dict(self) -> Dict[str, Union[float, list]]:
+        """
+        Convert config to dictionary (for JSON serialization).
+        
+        Returns:
+            Dictionary with tensor names and amax values
+        """
+        result = {}
+        for key, value in self.calibration_data.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    result[key] = value.item()
+                else:
+                    result[key] = value.tolist()
+            else:
+                result[key] = value
+        return result
 
 
 if __name__ == '__main__':
-    # Test NVFP quantization
-    A = torch.randn(1024, 1024).cuda()
+    device = 'cuda'
+    A = torch.randn(1024, 1024, device=device)
+    B = torch.randn(1024, 1024, device=device)
+    print(f"A_shape: {A.shape}, A_max: {torch.max(A):.4f}, A_min: {torch.min(A):.4f}")
+    print(f"B_shape: {B.shape}, B_max: {torch.max(B):.4f}, B_min: {torch.min(B):.4f}")
     
-    # Test different NVFP formats
-    for fmt in ['nvfp2', 'nvfp4', 'nvfp8']:
-        nvfp_quantized = quant_nvfp(A, nvfp_format=fmt)
-        print(f"\n{fmt} quantization:")
-        print(f"Original shape: {A.shape}, max: {torch.max(A):.4f}, min: {torch.min(A):.4f}")
-        print(f"Quantized shape: {nvfp_quantized.shape}, max: {torch.max(nvfp_quantized):.4f}, min: {torch.min(nvfp_quantized):.4f}")
-        mse = torch.mean((A - nvfp_quantized) ** 2)
-        print(f"MSE: {mse.item():.6f}")
+    C_nvfp8 = nvfp_matmul(A.transpose(-2, -1), B, nvfp_format='nvfp8_e4m3')
+    C_bf16 = torch.matmul(A.transpose(-2, -1), B).to(torch.bfloat16 if device == 'cuda' else torch.float32)
+    loss_nvfp = torch.mean((C_bf16 - C_nvfp8) ** 2)
     
-    # Test matrix multiplication
-    B = torch.randn(1024, 1024).cuda()
-    C_nvfp4 = nvfp_matmul(A.transpose(-2, -1), B, nvfp_format='nvfp4')
-    C_bf16 = torch.matmul(A.transpose(-2, -1), B).to(torch.bfloat16)
-    loss_nvfp = torch.mean((C_bf16 - C_nvfp4) ** 2)
-    print(f"\nMatrix multiplication MSE (nvfp4 vs bf16): {loss_nvfp.item():.6f}")
+    print(f"C_shape: {C_nvfp8.shape}, output_max: {torch.max(C_nvfp8):.4f}, output_min: {torch.min(C_nvfp8):.4f}")
+    print(f"loss_nvfp: {loss_nvfp.item():.6f}")
 

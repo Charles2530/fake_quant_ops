@@ -574,3 +574,4 @@ if __name__ == '__main__':
     loss_mxfp = torch.mean((C_bf16 - C_mxfp8) ** 2)
         
     print(f"C_shape:{C_mxfp8.shape},output_max:{torch.max(C_mxfp8)},output_min:{torch.min(C_mxfp8)}")
+    print(f"loss_mxfp: {loss_mxfp}")

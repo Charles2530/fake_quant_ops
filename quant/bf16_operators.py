@@ -513,3 +513,22 @@ def bf16_baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor
         return BF16BAddBmm.apply(input, batch1, batch2, beta, alpha)
 
 
+if __name__ == "__main__":
+    A = torch.randn(1024, 1024).cuda()
+    B = torch.randn(1024, 1024).cuda()
+    print(f"A_shape:{A.shape},grad_max:{torch.max(A)},grad_min:{torch.min(A)}")
+    print(f"B_shape:{B.shape},input_max:{torch.max(B)},input_min:{torch.min(B)}")
+
+    from hifp import hifp_matmul
+    from mxfp import mxfp_matmul
+    from nvfp import nvfp_matmul
+    C_hifp8 = hifp_matmul(A.transpose(-2,-1),B)
+    C_mxfp8 = mxfp_matmul(A.transpose(-2,-1),B,"fp8_e4m3")
+    C_nvfp8 = nvfp_matmul(A.transpose(-2, -1), B, nvfp_format='nvfp8_e4m3')
+    C_bf16 = torch.matmul(A.transpose(-2,-1),B).to(torch.bfloat16)
+    loss_hif = torch.mean((C_bf16 - C_hifp8) ** 2)
+    print(f"loss_hifp: {loss_hif}")
+    loss_mx = torch.mean((C_bf16 - C_mxfp8) ** 2)
+    print(f"loss_mx: {loss_mx}")
+    loss_nv = torch.mean((C_bf16 - C_nvfp8) ** 2)
+    print(f"loss_nv: {loss_nv}")
