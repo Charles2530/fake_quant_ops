@@ -540,7 +540,7 @@ def quant_dequant_qkv(q,k,v,elem_format='fp8_e5m2'):
     final_q = q + (q_temp - q.detach())
     final_k = k + (k_temp - k.detach())
     final_v = v + (v_temp - v.detach())
-    return final_q,final_k,final_v
+    return final_q.to(torch.bfloat16),final_k.to(torch.bfloat16),final_v.to(torch.bfloat16)
     
 def quant_dequant_tensor(tensor,elem_format='fp8_e5m2'):
     scale_bits = 8
