@@ -443,7 +443,7 @@ from torch.autograd import Function
 class MXFPMatMul(Function):
     @staticmethod
     def forward(ctx, A: torch.Tensor, B: torch.Tensor,
-                elem_format: str = 'fp8_e5m2', block_size: int = 32):
+                elem_format: str = 'fp8_e5m2', block_size: int = 32, minus_exp=None):
         ctx.save_for_backward(A, B)
         ctx.elem_format = elem_format
         ctx.block_size = block_size
@@ -451,12 +451,12 @@ class MXFPMatMul(Function):
         A_q = _quantize_mx(
             A, scale_bits=8, elem_format=elem_format,
             shared_exp_method="max", axes=-1, block_size=block_size,
-            round="nearest", flush_fp32_subnorms=False
+            round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp
         )
         B_q = _quantize_mx(
             B, scale_bits=8, elem_format=elem_format,
             shared_exp_method="max", axes=-2, block_size=block_size,
-            round="nearest", flush_fp32_subnorms=False
+            round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp
         )
         return torch.matmul(A_q, B_q)
 
@@ -473,13 +473,13 @@ class MXFPMatMul(Function):
 class MXFPBAddBmm(Function):
     @staticmethod
     def forward(ctx, input, batch1, batch2, beta=1.0, alpha=1.0,
-                elem_format='fp8_e5m2', block_size=32):
+                elem_format='fp8_e5m2', block_size=32, minus_exp=None):
         ctx.save_for_backward(input, batch1, batch2)
         ctx.beta, ctx.alpha = beta, alpha
         ctx.elem_format = elem_format
         ctx.block_size = block_size
         
-        mm_out = MXFPMatMul.apply(batch1, batch2, elem_format, block_size)
+        mm_out = MXFPMatMul.apply(batch1, batch2, elem_format, block_size, minus_exp)
         return beta * input + alpha * mm_out
 
     @staticmethod
@@ -497,12 +497,12 @@ class MXFPBAddBmm(Function):
         
         return grad_input, grad_batch1, grad_batch2, None, None, None, None
 
-def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32):
-    return MXFPMatMul.apply(A, B, elem_format, block_size)
+def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, minus_exp=None):
+    return MXFPMatMul.apply(A, B, elem_format, block_size, minus_exp)
 
 def mxfp_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,
-                 elem_format='fp8_e5m2', block_size=32):
-    return MXFPBAddBmm.apply(input, batch1, batch2, beta, alpha, elem_format, block_size)
+                 elem_format='fp8_e5m2', block_size=32, minus_exp=None):
+    return MXFPBAddBmm.apply(input, batch1, batch2, beta, alpha, elem_format, block_size, minus_exp)
 
 def quant_dequant_qkv(q,k,v,elem_format='fp8_e5m2'):
     scale_bits = 8
@@ -537,10 +537,11 @@ def quant_dequant_qkv(q,k,v,elem_format='fp8_e5m2'):
         round="nearest",
         flush_fp32_subnorms=False,
     )
-    final_q =( q + (q_temp - q.detach())).to(torch.bfloat16)
+    final_q = (q + (q_temp - q.detach())).to(torch.bfloat16)
     final_k = (k + (k_temp - k.detach())).to(torch.bfloat16)
-    final_v =( v + (v_temp - v.detach())).to(torch.bfloat16)
+    final_v = (v + (v_temp - v.detach())).to(torch.bfloat16)
     return final_q,final_k,final_v
+    
     
 def quant_dequant_tensor(tensor,elem_format='fp8_e5m2'):
     scale_bits = 8

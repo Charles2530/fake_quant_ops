@@ -1,11 +1,14 @@
 import numpy as np
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fake_quant_ops.quant.qtype import QType
 from torch import Tensor
 import torch
 import torch_npu
 from torch.autograd import Function
 def to_HiFX(x, G: int = 64, N: int = 4) -> np.ndarray:
-    x = np.array(x)
+    x = np.array(x)         
     Mi, Ni = x.shape[0],x.shape[1]
     Mcnt = np.ceil(Mi / G).astype(int)
     res = np.zeros((Mi,Ni))
