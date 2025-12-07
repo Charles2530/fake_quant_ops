@@ -276,3 +276,4 @@ if __name__ == "__main__":
     loss_nvfp = torch.mean((C_bf16 - C_nvfp4) ** 2)
     print(f"\nMatrix multiplication MSE (nvfp4 vs bf16): {loss_nvfp.item():.6f}")
 
+

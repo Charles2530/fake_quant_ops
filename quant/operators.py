@@ -117,3 +117,5 @@ def quant_dequant_qkv(q,k,v,forward_format='mxfp8_e4m3', backward_quantize=True,
     k = k.to(torch.bfloat16)
     v = v.to(torch.bfloat16)
     return q,k,v
+
+
