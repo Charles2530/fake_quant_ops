@@ -1,8 +1,8 @@
 import numpy as np
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from fake_quant_ops.quant.qtype import QType
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from fake_quant_ops.quant.ops.qtype import QType
 from torch import Tensor
 import torch
 from torch.autograd import Function
