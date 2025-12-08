@@ -26,10 +26,6 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
                 backward_quantize=True, backward_format='mxfp8_e4m3'):
         scale_bits = 8
         tensor_temp = tensor.clone()     
-        ctx.minus_exp = minus_exp
-        ctx.forward_format = forward_format
-        ctx.backward_quantize = backward_quantize
-        ctx.backward_format = backward_format 
         # Forward 量化
         if forward_format in ['mxfp8_e4m3', 'mxfp8_e5m2','mxfp4_e2m1']:
             # Convert format name from external API to internal format
@@ -40,7 +36,7 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
                 internal_format,
                 shared_exp_method="max",
                 axes=-1,
-                block_size=16,
+                block_size=32,
                 round="nearest",
                 flush_fp32_subnorms=False,
                 minus_exp=minus_exp
@@ -56,7 +52,8 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
         
         # 保存参数用于 backward
         ctx.backward_quantize = backward_quantize
-        ctx.backward_format = backward_format if backward_quantize else None
+        ctx.backward_format = backward_format 
+        ctx.minus_exp = minus_exp
         
         # STE: 允许梯度流回原 tensor，但使用量化后的值进行计算
         final_tensor = tensor + (tensor_temp - tensor.detach())
@@ -69,7 +66,6 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
             # 量化梯度
             scale_bits = 8
             grad_temp = grad_output.clone()
-            
             if ctx.backward_format in ['mxfp8_e4m3', 'mxfp8_e5m2','mxfp4_e2m1']:
                 # Convert format name from external API to internal format
                 internal_format = _convert_format_to_internal(ctx.backward_format)
@@ -79,13 +75,13 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
                     internal_format,
                     shared_exp_method="max",
                     axes=-1,
-                    block_size=16,
+                    block_size=32,
                     round="nearest",
                     flush_fp32_subnorms=False,
                     minus_exp=ctx.minus_exp
                 )
             elif ctx.backward_format in ['hif8']:
-                grad_temp = quant_hif8(grad_temp.detach(), minus_exp=ctx.minus_exp)
+                grad_temp = quant_hif8(grad_temp.detach())
             elif ctx.backward_format in ['nvfp8_e4m3', 'nvfp8_e5m2','nvfp4_e2m1']:
                 grad_temp = quant_nvfp(grad_temp.detach(), ctx.backward_format)
             elif ctx.backward_format in ['bf16']:

@@ -204,7 +204,7 @@ def _quantize_nvfp4_manual(x: Tensor, max_norm: float, amax: Optional[Tensor] = 
 @torch.no_grad()
 def quant_nvfp_core(
     x: Tensor, 
-    nvfp_format: str = 'nvfp4', 
+    nvfp_format: str = 'nvfp4_e2m1', 
     round: str = 'nearest',
     amax: Optional[Tensor] = None,
     scale: Optional[Tensor] = None
@@ -255,7 +255,7 @@ def quant_nvfp_core(
 
 def quant_nvfp(
     x: Tensor, 
-    nvfp_format: str = 'nvfp4', 
+    nvfp_format: str = 'nvfp4_e2m1', 
     round: str = 'nearest',
     amax: Optional[Tensor] = None,
     scale: Optional[Tensor] = None
