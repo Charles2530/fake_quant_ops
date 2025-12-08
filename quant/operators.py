@@ -119,3 +119,13 @@ def quant_dequant_qkv(q,k,v,forward_format='mxfp8_e4m3', backward_quantize=True,
     return q,k,v
 
 
+def quant_matmul(A,B,forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3'):
+    A = quant_dequant_tensor_with_backward(A, forward_format, None, backward_quantize, backward_format)
+    B = quant_dequant_tensor_with_backward(B, forward_format, None, backward_quantize, backward_format)
+    return torch.matmul(A,B)
+
+def quant_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3'):
+    input = quant_dequant_tensor_with_backward(input, forward_format, None, backward_quantize, backward_format)
+    batch1 = quant_dequant_tensor_with_backward(batch1, forward_format, None, backward_quantize, backward_format)
+    batch2 = quant_dequant_tensor_with_backward(batch2, forward_format, None, backward_quantize, backward_format)
+    return torch.baddbmm(input, batch1, batch2, beta=beta, alpha=alpha)
