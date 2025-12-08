@@ -453,6 +453,7 @@ class MXFPMatMul(Function):
         ctx.save_for_backward(A, B)
         ctx.elem_format = elem_format
         ctx.block_size = block_size
+        ctx.minus_exp = minus_exp
         
         A_q = _quantize_mx(
             A, scale_bits=8, elem_format=elem_format,
@@ -499,6 +500,7 @@ class MXFPBAddBmm(Function):
         ctx.beta, ctx.alpha = beta, alpha
         ctx.elem_format = elem_format
         ctx.block_size = block_size
+        ctx.minus_exp = minus_exp
         
         mm_out = MXFPMatMul.apply(batch1, batch2, elem_format, block_size, minus_exp)
         return beta * input + alpha * mm_out

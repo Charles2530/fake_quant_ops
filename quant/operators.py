@@ -25,7 +25,11 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
     def forward(ctx, tensor, forward_format='mxfp8_e4m3', minus_exp=None, 
                 backward_quantize=True, backward_format='mxfp8_e4m3'):
         scale_bits = 8
-        tensor_temp = tensor.clone()        
+        tensor_temp = tensor.clone()     
+        ctx.minus_exp = minus_exp
+        ctx.forward_format = forward_format
+        ctx.backward_quantize = backward_quantize
+        ctx.backward_format = backward_format 
         # Forward 量化
         if forward_format in ['mxfp8_e4m3', 'mxfp8_e5m2','mxfp4_e2m1']:
             # Convert format name from external API to internal format
@@ -78,11 +82,12 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
                     block_size=16,
                     round="nearest",
                     flush_fp32_subnorms=False,
+                    minus_exp=ctx.minus_exp
                 )
             elif ctx.backward_format in ['hif8']:
-                grad_temp = quant_hif8(grad_temp.detach())
+                grad_temp = quant_hif8(grad_temp.detach(), minus_exp=ctx.minus_exp)
             elif ctx.backward_format in ['nvfp8_e4m3', 'nvfp8_e5m2','nvfp4_e2m1']:
-                grad_temp = quant_nvfp(grad_temp.detach())
+                grad_temp = quant_nvfp(grad_temp.detach(), ctx.backward_format)
             elif ctx.backward_format in ['bf16']:
                 grad_temp = grad_temp.to(torch.bfloat16)
             else:
