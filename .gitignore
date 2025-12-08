@@ -85,3 +85,5 @@ Dockerfile.build
 
 
 
+data/
+*.zip

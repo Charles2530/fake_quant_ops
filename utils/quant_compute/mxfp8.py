@@ -31,7 +31,7 @@ EXP_MAX_E5M2 = 16
 
 
     
-def injectMatmalNora(A: torch.Tensor, B: torch.Tensor, mxfp8_mode: str = "e4m3", fb: str = "f", block_size: int = 32) -> torch.Tensor:
+def injectMatmulNora(A: torch.Tensor, B: torch.Tensor, mxfp8_mode: str = "e4m3", fb: str = "f", block_size: int = 32) -> torch.Tensor:
     shape_A = A.shape
     if len(shape_A) == 3:
         M, BS, K = shape_A
@@ -142,20 +142,20 @@ if __name__ == '__main__':
 
         print(f"Testing matrix shape: grad_output {grad_output.shape}, total_input {total_input.shape}, weight {weight.shape}")
         print(f'try to handle total_input x weight.t()')
-        C_input = injectMatmalNora(total_input.clone().npu(), weight.t().clone().npu(), "dhif8")
-        # C_input = injectMatmalNora(total_input, weight.t().clone(), "e4m3")
+        C_input = injectMatmulNora(total_input.clone().npu(), weight.t().clone().npu(), "dhif8")
+        # C_input = injectMatmulNora(total_input, weight.t().clone(), "e4m3")
         C = torch.matmul(total_input.clone().npu(), weight.t().clone().npu())
         _compute_mse(C,C_input)
         
         print(f'try to handle grad_output x weight')
-        C_input = injectMatmalNora(grad_output.clone().npu(), weight.clone().npu(), "dhif8")
-        # C_input = injectMatmalNora(grad_output, weight, "e4m3")
+        C_input = injectMatmulNora(grad_output.clone().npu(), weight.clone().npu(), "dhif8")
+        # C_input = injectMatmulNora(grad_output, weight, "e4m3")
         C = torch.matmul(grad_output.clone().npu(), weight.clone().npu())
         _compute_mse(C,C_input)
 
         print(f'try to handle grad_output.t x total_input')
-        C_input = injectMatmalNora(grad_output.t().clone().npu(), total_input.clone().npu(), "dhif8")
-        # C_input = injectMatmalNora(grad_output.t().clone(), total_input, "e4m3")
+        C_input = injectMatmulNora(grad_output.t().clone().npu(), total_input.clone().npu(), "dhif8")
+        # C_input = injectMatmulNora(grad_output.t().clone(), total_input, "e4m3")
         C = torch.matmul(grad_output.t().clone().npu(), total_input.clone().npu())
         _compute_mse(C,C_input)
        
