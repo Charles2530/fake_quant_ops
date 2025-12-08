@@ -490,7 +490,7 @@ class MXFPMatMul(Function):
             grad_A = torch.matmul(grad_output_q, B_q.transpose(-2, -1))
         if ctx.needs_input_grad[1]:
             grad_B = torch.matmul(A_q.transpose(-2, -1), grad_output_q)
-        return grad_A, grad_B, None, None  # None对应elem_format和block_size
+        return grad_A, grad_B, None, None, None # None对应elem_format和block_size,
 
 class MXFPBAddBmm(Function):
     @staticmethod
@@ -532,7 +532,7 @@ class MXFPBAddBmm(Function):
             grad_batch1 = torch.matmul(mm_grad, batch2_q.transpose(-2, -1))
             grad_batch2 = torch.matmul(batch1_q.transpose(-2, -1), mm_grad)
         
-        return grad_input, grad_batch1, grad_batch2, None, None, None, None
+        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None
 
 def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, minus_exp=None):
     return MXFPMatMul.apply(A, B, elem_format, block_size, minus_exp)
