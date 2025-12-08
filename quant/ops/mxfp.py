@@ -271,8 +271,8 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
                 n_bits = 4
             else:
                 raise ValueError("Unsupported element format")
-            minus_exp = calculate_minus_exp(shared_exp, n_bits=n_bits, distribution='laplace')
-            print(f"minus_exp is auto, minus_exp: {minus_exp}")
+            minus_exp = calculate_minus_exp(shared_exp, n_bits=n_bits, distribution='gaussian')
+            # print(f"minus_exp is auto, minus_exp: {minus_exp}")
         shared_exp = shared_exp - minus_exp
     else:
         shared_exp = torch.floor(
@@ -442,9 +442,6 @@ def _quantize_mx(
     return A
 
 
-
-
-
 import torch
 from torch.autograd import Function
 
@@ -603,7 +600,7 @@ def quant_dequant_tensor(tensor,elem_format='fp8_e5m2',minus_exp=None):
 import torch
 import math
 
-def _calculate_log2_beta(n_bits: int, distribution: str = 'laplace') -> float:
+def _calculate_log2_beta(n_bits: int, distribution: str = 'gaussian') -> float:
     if distribution.lower() == 'laplace':
         # 拉普拉斯分布的多项式近似: α_opt/E[|X|] ≈ 1.15 * n_bits + 0.59
         beta = 1.15 * n_bits + 0.59
@@ -618,7 +615,7 @@ def _calculate_log2_beta(n_bits: int, distribution: str = 'laplace') -> float:
 def calculate_minus_exp(
     tensor_block: torch.Tensor,
     n_bits: int = 8,
-    distribution: str = 'laplace'
+    distribution: str = 'gaussian'
 ) -> torch.Tensor:
     if tensor_block.numel() == 0:
         return torch.tensor(0, dtype=torch.int)
@@ -651,6 +648,7 @@ def calculate_minus_exp(
 
     # k ≈ (E_max - E_mean) - log₂(β)
     minus_exp_float = (e_max - e_mean) - log2_beta
+    # print(f"minus_exp_float: {minus_exp_float}")
     
     # 四舍五入到最近的整数并确保其不为负
     minus_exp = torch.round(minus_exp_float)
@@ -668,13 +666,13 @@ if __name__ == '__main__':
     loss_A = torch.mean((A - mxfp8) ** 2)
     print(f"loss_A: {loss_A}")
     
-    print(f"A_shape:{A.shape},grad_max:{torch.max(A)},grad_min:{torch.min(A)}")
+    print(f"A_shape:{A.shape},A_max:{torch.max(A)},A_min:{torch.min(A)}")
     B = torch.randn(1024, 1024).cuda()
-    print(f"B_shape:{B.shape},input_max:{torch.max(B)},input_min:{torch.min(B)}")
+    print(f"B_shape:{B.shape},B_max:{torch.max(B)},B_min:{torch.min(B)}")
 
     C_mxfp8 = mxfp_matmul(A.transpose(-2,-1),B)
     C_bf16 = torch.matmul(A.transpose(-2,-1),B).to(torch.bfloat16)
     loss_mxfp = torch.mean((C_bf16 - C_mxfp8) ** 2)
         
-    print(f"C_shape:{C_mxfp8.shape},output_max:{torch.max(C_mxfp8)},output_min:{torch.min(C_mxfp8)}")
+    print(f"C_shape:{C_mxfp8.shape},C_mxfp8_max:{torch.max(C_mxfp8)},C_mxfp8_min:{torch.min(C_mxfp8)}")
     print(f"loss_mxfp: {loss_mxfp}")
