@@ -17,7 +17,7 @@ from datetime import datetime
 # Add the parent directory to path to import mxfp module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from fake_quant_ops.quant.mxfp import _quantize_mx, _get_format_params, ElemFormat,_remove_scaling_mx
+from fake_quant_ops.quant.ops.mxfp import _quantize_mx, _get_format_params, ElemFormat
 
 def setup_logging(output_dir, tensor_name, elem_format):
     """
@@ -135,7 +135,8 @@ def calculate_metrics(original_tensor, quantized_tensor):
     }
 
 def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8, 
-                       max_scale_exp=10, min_scale_exp=-10, logger=None):
+                       max_scale_exp=10, min_scale_exp=-10, logger=None, 
+                       block_size=32, axes=-1):
     """
     Test different scaling levels for MXFP quantization.
     
@@ -146,6 +147,8 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         max_scale_exp (int): Maximum scale exponent (aligned with max value)
         min_scale_exp (int): Minimum scale exponent (aligned with min value)
         logger: Logger instance for output
+        block_size (int): Block size for tiling (0 means no tiling)
+        axes (int or list): Axes for shared exponent calculation
         
     Returns:
         dict: Results for each scaling level (all integers in range)
@@ -223,6 +226,8 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
     log_func(f"Testing integer scaling levels from {max_scale_exp:.2f} to {min_scale_exp:.2f}")
     log_func(f"Element format: {elem_format} (e{ebits}m{mbits})")
     log_func(f"Scale bits: {scale_bits}")
+    log_func(f"Block size: {block_size} (0 means no tiling)")
+    log_func(f"Axes: {axes}")
     log_func("-" * 60)
     
     for i, scale_exp in enumerate(scale_exponents):
@@ -231,7 +236,7 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         # Create a custom quantize function with fixed scale exponent
         quantized_tensor, overflow_underflow_analysis = quantize_with_fixed_scale(
             input_tensor, elem_format, scale_bits, scale_exp, 
-            ebits, mbits, max_norm
+            ebits, mbits, max_norm, axes=axes, block_size=block_size
         )
         
         # Calculate metrics
@@ -656,13 +661,15 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
                              ebits, mbits, max_norm, axes=None, block_size=0):
     """
     Custom quantization function with fixed scale exponent.
-    This function simulates the exact behavior of mxfp.py _quantize_mx function.
+    This function simulates the exact behavior of mxfp.py _quantize_mx function,
+    including block_size support.
     
     Args:
         input_tensor (torch.Tensor): Input tensor
         elem_format (str): Element format
         scale_bits (int): Number of scale bits
         scale_exp (float): Fixed scale exponent (log2 of scaling factor)
+                          This is the value after subtracting emax in _quantize_mx
         ebits (int): Exponent bits
         mbits (int): Mantissa bits
         max_norm (float): Maximum normal value
@@ -672,27 +679,87 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
     Returns:
         tuple: (quantized_tensor, overflow_underflow_analysis)
     """
+    from fake_quant_ops.quant.ops.mxfp import (
+        _quantize_elemwise_core, _reshape_to_blocks, _undo_reshape_to_blocks,
+        _get_min_norm, FP32_MIN_NORMAL
+    )
+    from fake_quant_ops.utils.saver.mxfp_saver import _analyze_overflow_underflow_before_quantization
+    
     A = input_tensor.clone()
     
-    # Apply scaling directly (this simulates the A = A / (2**shared_exp) step in mxfp.py)
-    scale_factor = 2.0 ** scale_exp  # Use float to handle negative exponents
-    A = A / scale_factor
+    # Make sure axes is a list of non-negative numbers (same as _quantize_mx)
+    if axes is None:
+        axes = []
+    else:
+        axes = [axes] if type(axes) == int else axes 
+        axes = [x + A.ndim if x < 0 else x for x in axes]  # convert negative axes to positive axes
     
-    # Quantize element-wise
-    from fake_quant_ops.quant.mxfp import _quantize_elemwise_core,_analyze_overflow_underflow_before_quantization
+    # Calculate emax
+    emax = 2**(ebits - 1) - 1 if ebits > 0 else 0
     
-    # Analyze overflow/underflow without printing (collect results)
+    # Perform tiling to the hardware vector size (same as _quantize_mx)
+    orig_shape = None
+    padded_shape = None
+    if block_size > 0:
+        A, axes, orig_shape, padded_shape = _reshape_to_blocks(A, axes, block_size)
+    
+    # Calculate shared_exp_axes (same as _quantize_mx)
+    # add 1 to share exp for the same block
+    shared_exp_axes = [x + 1 for x in axes] if block_size > 0 else axes
+    
+    # Calculate shared_exp using the same method as _quantize_mx
+    # In _quantize_mx, shared_exp is calculated from max absolute value
+    if shared_exp_axes is None or len(shared_exp_axes) == 0:
+        shared_exp = torch.max(torch.abs(A))
+    else:
+        shared_exp = A
+        for axis in shared_exp_axes:
+            shared_exp, _ = torch.max(torch.abs(shared_exp), dim=axis, keepdim=True)
+    
+    # Convert to log2 and floor (same as _shared_exponents with minus_exp=None)
+    shared_exp = torch.floor(
+        torch.log2(
+            shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+        )
+    )
+    
+    # Now adjust shared_exp to achieve the desired scale_exp
+    # In _quantize_mx: shared_exp = shared_exp - emax, then A = A / (2**shared_exp)
+    # We want: (shared_exp - emax) = scale_exp
+    # So: shared_exp = scale_exp + emax
+    # But we need to maintain the block structure, so we set all blocks to the same value
+    # Keep the shape of shared_exp but set all values to target_shared_exp
+    target_shared_exp = scale_exp + emax
+    shared_exp = torch.full_like(shared_exp, target_shared_exp, dtype=shared_exp.dtype)
+    
+    # Offset by emax (same as _quantize_mx line 424)
+    shared_exp = shared_exp - emax
+    
+    # Clamp shared_exp to scale_bits range (same as _quantize_mx lines 426-428)
+    scale_emax = 2**(scale_bits-1) - 1
+    shared_exp[shared_exp > scale_emax] = float("NaN")
+    shared_exp[shared_exp < -scale_emax] = -scale_emax
+    
+    # Apply scaling (same as _quantize_mx line 430)
+    A = A / (2**shared_exp)
+    
+    # Analyze overflow/underflow before quantization
     overflow_underflow_analysis = _analyze_overflow_underflow_before_quantization(
         A, elem_format, mbits, ebits, max_norm, verbose=False
     )
     
+    # Quantize element-wise (same as _quantize_mx lines 433-435)
     A = _quantize_elemwise_core(
         A, mbits, ebits, max_norm, round='nearest',
         allow_denorm=True, saturate_normals=True
     )
     
-    # Undo scaling
-    A = A * scale_factor
+    # Undo scaling (same as _quantize_mx line 437)
+    A = A * (2**shared_exp)
+    
+    # Undo tile reshaping (same as _quantize_mx lines 440-441)
+    if block_size > 0:
+        A = _undo_reshape_to_blocks(A, padded_shape, orig_shape, axes)
     
     return A, overflow_underflow_analysis
 
@@ -907,6 +974,7 @@ def save_results_to_file(results, output_path):
     pass
 
 def remove_scaling(A,elem_format):
+    from fake_quant_ops.utils.saver.mxfp_saver import _remove_scaling_mx
     return _remove_scaling_mx(A=A,
                 scale_bits=8,
                 elem_format=elem_format,
@@ -982,7 +1050,9 @@ def process_single_tensor(input_path, args, logger=None):
         args.scale_bits,
         max_scale_exp=args.max_scale_exp,
         min_scale_exp=args.min_scale_exp,
-        logger=tensor_logger
+        logger=tensor_logger,
+        block_size=getattr(args, 'block_size', 32),
+        axes=getattr(args, 'axes', -1)
     )
     
     # Save results to file
@@ -1043,6 +1113,10 @@ def main():
                         help='Maximum scale exponent (default: auto-calculated from tensor max if using default value)')
     parser.add_argument('--min-scale-exp', type=int, default=-10,
                         help='Minimum scale exponent (default: auto-calculated from tensor min if using default value)')
+    parser.add_argument('--block-size', type=int, default=32,
+                        help='Block size for tiling (default: 32, use 0 for no tiling)')
+    parser.add_argument('--axes', type=int, default=-1,
+                        help='Axes for shared exponent calculation (default: -1)')
     parser.add_argument('--no-plots', action='store_true',
                         help='Skip generating plots')
     

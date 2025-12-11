@@ -36,7 +36,8 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
                 internal_format,
                 shared_exp_method="max",
                 axes=-1,
-                block_size=32,
+                # adaptive block size
+                block_size=32 if forward_format in ['mxfp8_e4m3', 'mxfp8_e5m2'] else 16,
                 round="nearest",
                 flush_fp32_subnorms=False,
                 minus_exp=minus_exp
@@ -75,7 +76,8 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
                     internal_format,
                     shared_exp_method="max",
                     axes=-1,
-                    block_size=32,
+                    # adaptive block size
+                    block_size=32 if ctx.backward_format in ['mxfp8_e4m3', 'mxfp8_e5m2'] else 16,
                     round="nearest",
                     flush_fp32_subnorms=False,
                     minus_exp=ctx.minus_exp

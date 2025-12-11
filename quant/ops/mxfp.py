@@ -273,7 +273,6 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
                 raise ValueError("Unsupported element format")
             minus_exp = calculate_minus_exp(shared_exp, n_bits=n_bits, distribution='gaussian')
             print(f"minus_exp is auto, minus_exp: {minus_exp}")
-            # import pdb; pdb.set_trace()
         shared_exp = shared_exp - minus_exp
     else:
         shared_exp = torch.floor(
@@ -662,21 +661,25 @@ def calculate_minus_exp(
 
 if __name__ == '__main__':
     A = torch.load("data/bf16/20250923_100434_0548_iter000_linear_L1_backward_pre_linear_bf16_rank00_group000_input.pt", map_location='cpu')['tensor'].cuda()
-    minus_exp = 0
-    mxfp8_A = _quantize_mx(A, scale_bits=8, elem_format='fp4_e2m1', shared_exp_method="max", axes=-1, block_size=32, round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp)
-    loss_A = torch.mean((A - mxfp8_A) ** 2)
-    print(f"loss_A: {loss_A}")
-    
-    print(f"A_shape:{A.shape},A_max:{torch.max(A)},A_min:{torch.min(A)}")
-    B = torch.load("data/bf16/20250923_100434_0549_iter000_linear_L1_backward_pre_linear_bf16_rank00_group000_weight.pt", map_location='cpu')['tensor'].cuda() 
-    mxfp8_B = _quantize_mx(B, scale_bits=8, elem_format='fp4_e2m1', shared_exp_method="max", axes=-1, block_size=32, round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp)
-    loss_B = torch.mean((B - mxfp8_B) ** 2)
-    print(f"loss_B: {loss_B}")
-    print(f"B_shape:{B.shape},B_max:{torch.max(B)},B_min:{torch.min(B)}")
+    minus_exp_list = [None,0,1]
+    block_size_list = [32,16]
+    for minus_exp in minus_exp_list:
+        for block_size in block_size_list:
+            print(f"minus_exp: {minus_exp}, block_size: {block_size}")
+            mxfp8_A = _quantize_mx(A, scale_bits=8, elem_format='fp4_e2m1', shared_exp_method="max", axes=-1, block_size=block_size, round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp)
+            loss_A = torch.mean((A - mxfp8_A) ** 2)
+            print(f"loss_A: {loss_A}")
+            
+            # print(f"A_shape:{A.shape},A_max:{torch.max(A)},A_min:{torch.min(A)}")
+            B = torch.load("data/bf16/20250923_100434_0549_iter000_linear_L1_backward_pre_linear_bf16_rank00_group000_weight.pt", map_location='cpu')['tensor'].cuda() 
+            mxfp8_B = _quantize_mx(B, scale_bits=8, elem_format='fp4_e2m1', shared_exp_method="max", axes=-1, block_size=block_size, round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp)
+            loss_B = torch.mean((B - mxfp8_B) ** 2)
+            print(f"loss_B: {loss_B}")
+            # print(f"B_shape:{B.shape},B_max:{torch.max(B)},B_min:{torch.min(B)}")
 
-    C_mxfp8 = mxfp_matmul(A,B,minus_exp=minus_exp)
-    C_bf16 = torch.matmul(A,B).to(torch.bfloat16)
-    loss_mxfp = torch.mean((C_bf16 - C_mxfp8) ** 2)
-        
-    print(f"C_shape:{C_mxfp8.shape},C_mxfp8_max:{torch.max(C_mxfp8)},C_mxfp8_min:{torch.min(C_mxfp8)}")
-    print(f"loss_mxfp: {loss_mxfp}")
+            C_mxfp8 = mxfp_matmul(A,B,block_size=block_size,minus_exp=minus_exp)
+            C_bf16 = torch.matmul(A,B).to(torch.bfloat16)
+            loss_mxfp = torch.mean((C_bf16 - C_mxfp8) ** 2)
+                
+            # print(f"C_shape:{C_mxfp8.shape},C_mxfp8_max:{torch.max(C_mxfp8)},C_mxfp8_min:{torch.min(C_mxfp8)}")
+            print(f"loss_mxfp: {loss_mxfp}")

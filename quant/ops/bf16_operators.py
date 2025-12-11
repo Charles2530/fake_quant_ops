@@ -62,7 +62,7 @@ class BF16BAddBmm(Function):
             grad_batch1 = torch.bmm(mm_grad, batch2.transpose(-2, -1))
             grad_batch2 = torch.bmm(batch1.transpose(-2, -1), mm_grad)
 
-        return grad_input, grad_batch1, grad_batch2
+        return grad_input, grad_batch1, grad_batch2,None,None
                     
 def bf16_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return BF16MatMul.apply(A, B)
