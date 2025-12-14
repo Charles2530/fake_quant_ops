@@ -1,7 +1,7 @@
 import torch
 from enum import Enum, IntEnum
 import numpy as np
-
+import math
 
 FP32_EXPONENT_BIAS = 127
 FP32_MIN_NORMAL = 2 ** (-FP32_EXPONENT_BIAS + 1)
@@ -31,12 +31,10 @@ class ElemFormat(Enum):
         else:
             raise Exception("Undefined elem format", s)
 
-
 def _get_min_norm(ebits):
     """ Valid for all float formats """
     emin = 2 - (2 ** (ebits - 1))
     return 0 if ebits == 0 else 2 ** emin
-
 
 def _get_max_norm(ebits, mbits):
     """ Valid only for floats that define NaN """
@@ -44,8 +42,8 @@ def _get_max_norm(ebits, mbits):
     emax = 0 if ebits==0 else 2**(ebits - 1) - 1
     return 2**emax * float(2**(mbits-1) - 1) / 2**(mbits-2)
 
-
 _FORMAT_CACHE = {}
+
 def _get_format_params(fmt):
     """ Allowed formats:
         - intX:         2 <= X <= 32, assume sign-magnitude, 1.xxx representation
@@ -54,7 +52,6 @@ def _get_format_params(fmt):
         - fp4,                  no NaN/Inf
         - fp6_e3m2/e2m3,        no NaN/Inf
         - fp8_e4m3/e5m2,        e5m2 normal NaN/Inf, e4m3 special behavior
-
         Returns:
           ebits: exponent bits
           mbits: mantissa bits: includes sign and implicit bits
@@ -64,7 +61,6 @@ def _get_format_params(fmt):
     """
     if type(fmt) is str:
         fmt = ElemFormat.from_str(fmt)
-
     if fmt in _FORMAT_CACHE:
         return _FORMAT_CACHE[fmt]
 
@@ -107,11 +103,8 @@ def _get_format_params(fmt):
         max_norm = 2**emax * 1.75  # FP8 has custom max_norm
 
     min_norm = _get_min_norm(ebits)
-
     _FORMAT_CACHE[fmt] = (ebits, mbits, emax, max_norm, min_norm)
-
     return ebits, mbits, emax, max_norm, min_norm
-
 
 def _safe_lshift(x, bits, exp):
     if exp is None:
@@ -119,13 +112,11 @@ def _safe_lshift(x, bits, exp):
     else:
         return x / (2 ** exp) * (2**bits)
 
-
 def _safe_rshift(x, bits, exp):
     if exp is None:
         return x / (2**bits)
     else:
         return x / (2**bits) * (2 ** exp)
-
 
 def _round_mantissa(A, bits, round, clamp=False):
     """
@@ -138,7 +129,6 @@ def _round_mantissa(A, bits, round, clamp=False):
     Returns:
       A {PyTorch tensor} -- Tensor with mantissas rounded
     """
-
     if round == "dither":
         rand_A = torch.rand_like(A, requires_grad=False)
         A = torch.sign(A) * torch.floor(torch.abs(A) + rand_A)
@@ -159,7 +149,6 @@ def _round_mantissa(A, bits, round, clamp=False):
         max_mantissa = 2 ** (bits - 1) - 1
         A = torch.clamp(A, -max_mantissa, max_mantissa)
     return A
-
 
 def _quantize_elemwise_core(A, bits, exp_bits, max_norm, round='nearest',
                             saturate_normals=False, allow_denorm=True):
@@ -183,7 +172,6 @@ def _quantize_elemwise_core(A, bits, exp_bits, max_norm, round='nearest',
     if A_is_sparse:
         if A.layout != torch.sparse_coo:
             raise NotImplementedError("Only COO layout sparse tensors are currently supported.")
-
         sparse_A = A.coalesce()
         A = sparse_A.values().clone()
 
@@ -197,7 +185,6 @@ def _quantize_elemwise_core(A, bits, exp_bits, max_norm, round='nearest',
     if exp_bits != 0:
         private_exp = torch.floor(torch.log2(
             torch.abs(A) + (A == 0).type(A.dtype)))
-
         # The minimum representable exponent for 8 exp bits is -126
         min_exp = -(2**(exp_bits-1)) + 2
         private_exp = private_exp.clip(min=min_exp)
@@ -206,9 +193,7 @@ def _quantize_elemwise_core(A, bits, exp_bits, max_norm, round='nearest',
 
     # Scale up so appropriate number of bits are in the integer portion of the number
     out = _safe_lshift(out, bits - 2, private_exp)
-
     out = _round_mantissa(out, bits, round, clamp=False)
-
     # Undo scaling
     out = _safe_rshift(out, bits - 2, private_exp)
 
@@ -219,20 +204,13 @@ def _quantize_elemwise_core(A, bits, exp_bits, max_norm, round='nearest',
         out = torch.where((torch.abs(out) > max_norm),
                            torch.sign(out) * float("Inf"), out)
 
-    # handle Inf/NaN
-    # out[A == float("Inf")] = float("Inf")
-    # out[A == -float("Inf")] = -float("Inf")
-    # out[A == float("NaN")] = float("NaN")
-
     if A_is_sparse:
         output = torch.sparse_coo_tensor(sparse_A.indices(), output,
                 sparse_A.size(), dtype=sparse_A.dtype, device=sparse_A.device,
                 requires_grad=sparse_A.requires_grad)
-
     return out
 
-
-def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2', minus_exp=None):
+def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2', minus_exp=None, heuristic_level=None):
     """
     Get shared exponents for the passed matrix A.
     Args:
@@ -242,10 +220,10 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
                                  "none" uses an exponent for each value (i.e., no sharing)
       axes   {list(int)}      -- List of integers which specifies the axes across which
                                  shared exponents are calculated.
+      heuristic_level {int}   -- Level of heuristic to use for 'auto' minus_exp (0-3).
     Returns:
       shared_exp {PyTorch tensor} -- Tensor of shared exponents
     """
-
     if method == "max":
         if axes is None:
             shared_exp = torch.max(torch.abs(A))
@@ -257,6 +235,7 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
         shared_exp = torch.abs(A)
     else:
         raise Exception("Unrecognized shared exponent selection method %s" % (method))
+
     # log2(shared_exp) and truncate to integer
     if minus_exp is not None:
         shared_exp = torch.ceil(
@@ -265,14 +244,8 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
             )
         )
         if minus_exp == "auto":
-            if elem_format in ['fp8_e5m2', 'fp8_e4m3']:
-                n_bits = 8
-            elif elem_format in ['fp4_e2m1']:
-                n_bits = 4
-            else:
-                raise ValueError("Unsupported element format")
-            minus_exp = calculate_minus_exp(shared_exp, n_bits=n_bits, distribution='gaussian')
-            print(f"minus_exp is auto, minus_exp: {minus_exp}")
+            minus_exp = calculate_minus_exp(A, elem_format=elem_format, distribution='gaussian', axis=-1, heuristic_level=heuristic_level)
+            # print(f"minus_exp is auto, calculated per-block with heuristic level {heuristic_level}.")
         shared_exp = shared_exp - minus_exp
     else:
         shared_exp = torch.floor(
@@ -284,15 +257,9 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
     # Restrict to [-emax, emax] range
     if ebits > 0:
         emax = 2**(ebits-1) - 1
-        #shared_exp = torch.clamp(shared_exp, -emax, emax)
-        # Overflow to Inf
         shared_exp[shared_exp > emax] = float("NaN")
-        # Underflows are set to -127 which causes them to be
-        # flushed to 0 later
         shared_exp[shared_exp < -emax] = -emax
-
     return shared_exp
-
 
 def _reshape_to_blocks(A, axes, block_size):
     if axes is None:
@@ -318,13 +285,11 @@ def _reshape_to_blocks(A, axes, block_size):
     pad = []
     for i in range(len(orig_shape)):
         pad += [0, 0]
-
     do_padding = False
     for axis in axes:
         pre_pad_size = orig_shape[axis]
         if isinstance(pre_pad_size, torch.Tensor):
             pre_pad_size = int(pre_pad_size.value)
-        # Don't pad if the axis is short enough to fit inside one tile
         if pre_pad_size % block_size == 0:
             pad[2 * axis] = 0
         else:
@@ -337,24 +302,19 @@ def _reshape_to_blocks(A, axes, block_size):
 
     def _reshape(shape, reshape_block_size):
         for axis in axes:
-            # Reshape to tiles if axis length > reshape_block_size
             if shape[axis] >= reshape_block_size:
                 assert shape[axis] % reshape_block_size == 0
                 shape[axis + 1] = reshape_block_size
                 shape[axis] = shape[axis] // reshape_block_size
-            # Otherwise preserve length and insert a 1 into the shape
             else:
                 shape[axis + 1] = shape[axis]
                 shape[axis] = 1
         return shape
 
-    # Reshape to tiles
     padded_shape = A.size()
     reshape = _reshape(list(padded_shape), block_size)
-
     A = A.view(reshape)
     return A, axes, orig_shape, padded_shape
-
 
 def _undo_reshape_to_blocks(A, padded_shape, orig_shape, axes):
     # Undo tile reshaping
@@ -368,101 +328,86 @@ def _undo_reshape_to_blocks(A, padded_shape, orig_shape, axes):
         A = torch.squeeze(A, dim=axis + 1)
     return A
 
-
 def _quantize_mx(
     A,
     scale_bits,
-    elem_format,    # can be None for no quantization
+    elem_format,
     shared_exp_method="max",
     axes=None,
     block_size=0,
     round="nearest",
     flush_fp32_subnorms=False,
     minus_exp=None,
+    heuristic_level=None
 ):
     """Function used for MX* quantization
     """
-    # Shortcut for no quantization
     if elem_format == None:
         return A
 
     assert(scale_bits > 0)
-
-    # Make sure axes is a list of non-negative numbers
     if axes is None:
         axes = []
     else:
-        axes = [axes] if type(axes) == int else axes 
-        axes = [x + A.ndim if x < 0 else x for x in axes] # convert negative axes to positive axes
+        axes = [axes] if type(axes) == int else axes
+        axes = [x + A.ndim if x < 0 else x for x in axes]
 
-    ebits, mbits, emax, max_norm, _ = _get_format_params(elem_format) # ebits: exponent bits, mbits: mantissa bits, emax: max normal exponent, max_norm: max normal number
+    ebits, mbits, emax, max_norm, _ = _get_format_params(elem_format)
 
-    # Perform tiling to the hardware vector size
     if block_size > 0:
-        A, axes, orig_shape, padded_shape = _reshape_to_blocks(
+        A_reshaped, axes, orig_shape, padded_shape = _reshape_to_blocks(
             A, axes, block_size
         )
+    else:
+        A_reshaped = A
 
-    ####################
-    # Quantize
-    ####################
-    # add 1 to share exp for the same block
-    shared_exp_axes = [x + 1 for x in axes] if block_size > 0 else axes 
-
-    # Get shared exponents
+    shared_exp_axes = [x + 1 for x in axes] if block_size > 0 else axes
     shared_exp = _shared_exponents(
-        A, method=shared_exp_method, axes=shared_exp_axes, ebits=0,elem_format=elem_format, minus_exp=minus_exp,
+        A_reshaped, method=shared_exp_method, axes=shared_exp_axes, ebits=0,elem_format=elem_format, 
+        minus_exp=minus_exp, heuristic_level=heuristic_level,
     )
 
-    # Flush subnormal FP32 inputs to zero
     if flush_fp32_subnorms:
-        A = A * (shared_exp > -FP32_EXPONENT_BIAS).type(A.dtype)
+        A_reshaped = A_reshaped * (shared_exp > -FP32_EXPONENT_BIAS).type(A.dtype)
 
-    # Offset the max exponent by the largest representable exponent
-    # in the element data format
     shared_exp = shared_exp - emax
 
     scale_emax = 2**(scale_bits-1) - 1
     shared_exp[shared_exp > scale_emax] = float("NaN")
     shared_exp[shared_exp < -scale_emax] = -scale_emax
 
-    A = A / (2**shared_exp)
-
-    # _quantize_elemwise_core: quantize mantissa and exponent
-    A = _quantize_elemwise_core(
-            A, mbits, ebits, max_norm, round=round,
+    A_q = A_reshaped / (2**shared_exp)
+    A_q = _quantize_elemwise_core(
+            A_q, mbits, ebits, max_norm, round=round,
             allow_denorm=True, saturate_normals=True)
+    A_q = A_q * (2**shared_exp)
 
-    A = A * (2**shared_exp)
+    if block_size > 0:
+        A_q = _undo_reshape_to_blocks(A_q, padded_shape, orig_shape, axes)
 
-    # Undo tile reshaping
-    if block_size:
-        A = _undo_reshape_to_blocks(A, padded_shape, orig_shape, axes)
-
-    return A
-
-
+    return A_q
 import torch
 from torch.autograd import Function
 
 class MXFPMatMul(Function):
     @staticmethod
     def forward(ctx, A: torch.Tensor, B: torch.Tensor,
-                elem_format: str = 'fp8_e5m2', block_size: int = 32, minus_exp=None):
+                elem_format: str = 'fp8_e5m2', block_size: int = 32, minus_exp=None, heuristic_level=3):
         ctx.save_for_backward(A, B)
         ctx.elem_format = elem_format
         ctx.block_size = block_size
         ctx.minus_exp = minus_exp
+        ctx.heuristic_level = heuristic_level
         
         A_q = _quantize_mx(
             A, scale_bits=8, elem_format=elem_format,
             shared_exp_method="max", axes=-1, block_size=block_size,
-            round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp
+            round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp, heuristic_level=heuristic_level
         )
         B_q = _quantize_mx(
             B, scale_bits=8, elem_format=elem_format,
             shared_exp_method="max", axes=-2, block_size=block_size,
-            round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp
+            round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp, heuristic_level=heuristic_level
         )
         return torch.matmul(A_q, B_q)
 
@@ -472,214 +417,165 @@ class MXFPMatMul(Function):
         A_q = _quantize_mx(
             A, scale_bits=8, elem_format=ctx.elem_format,
             shared_exp_method="max", axes=-1, block_size=ctx.block_size,
-            round="nearest", flush_fp32_subnorms=False, minus_exp=ctx.minus_exp
+            round="nearest", flush_fp32_subnorms=False, minus_exp=ctx.minus_exp, heuristic_level=ctx.heuristic_level
         )
         B_q = _quantize_mx(
             B, scale_bits=8, elem_format=ctx.elem_format,
             shared_exp_method="max", axes=-2, block_size=ctx.block_size,
-            round="nearest", flush_fp32_subnorms=False, minus_exp=ctx.minus_exp
+            round="nearest", flush_fp32_subnorms=False, minus_exp=ctx.minus_exp, heuristic_level=ctx.heuristic_level
         )
         grad_output_q = _quantize_mx(
             grad_output, scale_bits=8, elem_format=ctx.elem_format,
             shared_exp_method="max", axes=-1, block_size=ctx.block_size,
-            round="nearest", flush_fp32_subnorms=False, minus_exp=ctx.minus_exp
+            round="nearest", flush_fp32_subnorms=False, minus_exp=ctx.minus_exp, heuristic_level=ctx.heuristic_level
         )
         grad_A = grad_B = None
         if ctx.needs_input_grad[0]:
             grad_A = torch.matmul(grad_output_q, B_q.transpose(-2, -1))
         if ctx.needs_input_grad[1]:
             grad_B = torch.matmul(A_q.transpose(-2, -1), grad_output_q)
-        return grad_A, grad_B, None, None, None # None对应elem_format和block_size,
+        return grad_A, grad_B, None, None, None, None
 
-class MXFPBAddBmm(Function):
-    @staticmethod
-    def forward(ctx, input, batch1, batch2, beta=1.0, alpha=1.0,
-                elem_format='fp8_e5m2', block_size=32, minus_exp=None):
-        ctx.save_for_backward(input, batch1, batch2)
-        ctx.beta, ctx.alpha = beta, alpha
-        ctx.elem_format = elem_format
-        ctx.block_size = block_size
-        ctx.minus_exp = minus_exp
-        
-        mm_out = MXFPMatMul.apply(batch1, batch2, elem_format, block_size, minus_exp)
-        return beta * input + alpha * mm_out
+def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, minus_exp=None, heuristic_level=3):
+    return MXFPMatMul.apply(A, B, elem_format, block_size, minus_exp, heuristic_level)
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        input, batch1, batch2 = ctx.saved_tensors
-        beta, alpha = ctx.beta, ctx.alpha
-        batch1_q = _quantize_mx(
-            batch1, scale_bits=8, elem_format=ctx.elem_format,
-            shared_exp_method="max", axes=-1, block_size=ctx.block_size,
-            round="nearest", flush_fp32_subnorms=False, minus_exp=ctx.minus_exp
-        )
-        batch2_q = _quantize_mx(
-            batch2, scale_bits=8, elem_format=ctx.elem_format,
-            shared_exp_method="max", axes=-2, block_size=ctx.block_size,
-            round="nearest", flush_fp32_subnorms=False, minus_exp=ctx.minus_exp
-        )
-        grad_output_q = _quantize_mx(
-            grad_output, scale_bits=8, elem_format=ctx.elem_format,
-            shared_exp_method="max", axes=-1, block_size=ctx.block_size,
-            round="nearest", flush_fp32_subnorms=False, minus_exp=ctx.minus_exp
-        )
-        grad_input = grad_batch1 = grad_batch2 = None
-        if ctx.needs_input_grad[0]:
-            grad_input = beta * grad_output_q
-        if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
-            mm_grad = alpha * grad_output_q
-            grad_batch1 = torch.matmul(mm_grad, batch2_q.transpose(-2, -1))
-            grad_batch2 = torch.matmul(batch1_q.transpose(-2, -1), mm_grad)
-        
-        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None
-
-def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, minus_exp=None):
-    return MXFPMatMul.apply(A, B, elem_format, block_size, minus_exp)
-
-def mxfp_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,
-                 elem_format='fp8_e5m2', block_size=32, minus_exp=None):
-    return MXFPBAddBmm.apply(input, batch1, batch2, beta, alpha, elem_format, block_size, minus_exp)
-
-def quant_dequant_qkv(q,k,v,elem_format='fp8_e5m2',minus_exp=None):
-    scale_bits = 8
-    q_temp,k_temp,v_temp = q.clone(),k.clone(),v.clone()
-    q_temp = _quantize_mx(
-        q_temp.detach(),
-        scale_bits,
-        elem_format,
-        shared_exp_method="max",
-        axes=-1,
-        block_size=16,
-        round="nearest",
-        flush_fp32_subnorms=False,
-        minus_exp=minus_exp
-    )
-    k_temp = _quantize_mx(
-        k_temp.detach(),
-        scale_bits,
-        elem_format,
-        shared_exp_method="max",
-        axes=-1,
-        block_size=16,
-        round="nearest",
-        flush_fp32_subnorms=False,
-        minus_exp=minus_exp
-    )
-    v_temp = _quantize_mx(
-        v_temp.detach(),
-        scale_bits,
-        elem_format,
-        shared_exp_method="max",
-        axes=-1,
-        block_size=16,
-        round="nearest",
-        flush_fp32_subnorms=False,
-        minus_exp=minus_exp
-    )
-    final_q = (q + (q_temp - q.detach())).to(torch.bfloat16)
-    final_k = (k + (k_temp - k.detach())).to(torch.bfloat16)
-    final_v = (v + (v_temp - v.detach())).to(torch.bfloat16)
-    return final_q,final_k,final_v
-    
-    
-def quant_dequant_tensor(tensor,elem_format='fp8_e5m2',minus_exp=None):
-    scale_bits = 8
-    tensor_temp = tensor.clone()
-    tensor_temp = _quantize_mx(
-        tensor_temp.detach(),
-        scale_bits,
-        elem_format,
-        shared_exp_method="max",
-        axes=-1,
-        block_size=16,
-        round="nearest",
-        flush_fp32_subnorms=False,
-        minus_exp=minus_exp
-    )
-    final_tensor = tensor + (tensor_temp - tensor.detach())
-    return final_tensor
-
-import torch
-import math
-
-def _calculate_log2_beta(n_bits: int, distribution: str = 'gaussian') -> float:
-    if distribution.lower() == 'laplace':
-        # 拉普拉斯分布的多项式近似: α_opt/E[|X|] ≈ 1.15 * n_bits + 0.59
-        beta = 1.15 * n_bits + 0.59
-    elif distribution.lower() == 'gaussian':
-        # 高斯分布的多项式近似: α_opt/E[|X|] ≈ 0.76 * n_bits + 0.41
-        beta = 0.76 * n_bits + 0.41
+def _get_kappa(elem_format: str, distribution: str='gaussian') -> float:
+    if elem_format == 'fp4_e2m1' and distribution == 'gaussian':
+        kappa = 0.020974709594546316
     else:
-        raise ValueError("Unsupported distribution. Please choose 'laplace' or 'gaussian'.")
-    
-    return math.log2(beta)
+        from quant.ops.utils import _calculate_kappa
+        kappa = _calculate_kappa(elem_format, distribution)
+    return kappa
 
 def calculate_minus_exp(
     tensor_block: torch.Tensor,
-    n_bits: int = 8,
-    distribution: str = 'gaussian'
+    elem_format: str = 'fp8_e4m3',
+    distribution: str = 'gaussian',
+    axis: int = -1,
+    heuristic_level: int = 3
 ) -> torch.Tensor:
+    """
+    Calculates the 'minus_exp' for scaling per-block along a specified axis,
+    incorporating a multi-stage heuristic with controllable depth.
+    """
+    kappa = _get_kappa(elem_format, distribution)
     if tensor_block.numel() == 0:
-        return torch.tensor(0, dtype=torch.int)
+        return torch.tensor(0, dtype=torch.int, device=tensor_block.device)
 
-    # 添加一个小的 epsilon 以防止对零张量取 log(0)。
+    # Use float32 for calculations to avoid overflow and precision issues
+    x_abs = torch.abs(tensor_block.to(torch.float32))
     epsilon = 1e-9
+
+    # --- Pre-calculate statistics needed for aggressive scaling ---
+    V_max_aggressive, _ = torch.max(x_abs, dim=axis, keepdim=True)
+    mu_aggressive = torch.mean(x_abs, dim=axis, keepdim=True)
     
-    x_abs = torch.abs(tensor_block)
-    
-    amax = torch.max(x_abs)
-    if amax < epsilon:
-        return torch.tensor(0, dtype=torch.int)
-        
-    mean_abs = torch.mean(x_abs)
-    if mean_abs < epsilon:
-        # 如果均值为零但最大值不为零，则为非常稀疏的张量。
-        # 不进行缩减是最安全的选择。
-        return torch.tensor(0, dtype=torch.int)
+    # --- Heuristic Decision Logic ---
+    if heuristic_level == 0:
+        # No heuristic, always proceed with aggressive scaling for non-zero blocks
+        proceed_mask = V_max_aggressive >= epsilon
+    else:
+        # Initialize masks
+        V_max = V_max_aggressive
+        proceed_mask = torch.zeros_like(V_max, dtype=torch.bool)
+        undecided_mask = V_max >= epsilon # Only non-zero blocks are candidates
 
-    # E_max: 最大值的对数近似
-    # E_max ≈ floor(log₂(max(|x|)))
-    e_max = torch.floor(torch.log2(amax))
+        # --- Stage 1: Pre-check via V_max Threshold ---
+        if heuristic_level >= 1:
+            V_th = (2.0 / kappa)**(1/3.0)
+            s1_pass = (V_max > V_th) & undecided_mask
+            proceed_mask[s1_pass] = True
+            undecided_mask[s1_pass] = False
 
-    # E_mean: 平均值的对数近似
-    # E_mean ≈ log₂(mean(|x|))
-    e_mean = torch.log2(mean_abs)
+        # --- Stage 2: Quick Rejection via Upper Bound ---
+        if heuristic_level >= 2:
+            # Only calculate for blocks that are still undecided
+            undecided_indices = torch.where(undecided_mask)
+            if undecided_indices[0].numel() > 0:
+                V_max_s2 = V_max[undecided_indices]
+                mu_s2 = mu_aggressive[undecided_indices]
+                
+                C_vmax_s2 = (2.0 / (7.0 * kappa * V_max_s2 + epsilon)) - (V_max_s2.pow(2) / 7.0)
+                n = tensor_block.shape[axis]
+                E_upper_s2 = n * mu_s2 * V_max_s2
+                
+                s2_reject = E_upper_s2 <= C_vmax_s2
+                
+                # Update the main undecided_mask by setting rejected blocks to False
+                temp_undecided = undecided_mask.clone()
+                temp_undecided[undecided_indices] = ~s2_reject
+                undecided_mask = temp_undecided
 
-    # log₂(β): 根据 n_bits 和分布计算
-    log2_beta = _calculate_log2_beta(n_bits, distribution)
+        # --- Stage 3: Exact Calculation ---
+        if heuristic_level >= 3:
+            # Only calculate for blocks that are still undecided
+            undecided_indices = torch.where(undecided_mask)
+            if undecided_indices[0].numel() > 0:
+                V_max_s3 = V_max[undecided_indices]
+                # Create a view of x_abs that matches the undecided_mask shape
+                mask_shape = undecided_mask.shape
+                view_shape = list(x_abs.shape)
+                if axis != -1 and axis != len(view_shape) - 1:
+                    # Make the axis of reduction the last one for easier indexing
+                    x_abs_swapped = x_abs.transpose(axis, -1)
+                    view_shape[axis], view_shape[-1] = view_shape[-1], view_shape[axis]
+                else:
+                    x_abs_swapped = x_abs
 
-    # k ≈ (E_max - E_mean) - log₂(β)
-    minus_exp_float = (e_max - e_mean) - log2_beta
-    print(f"minus_exp_float: {minus_exp_float}")
-    
-    # 四舍五入到最近的整数并确保其不为负
-    minus_exp = torch.round(minus_exp_float)
-    minus_exp_clipped = torch.clamp(minus_exp, min=0)
+                # This is complex to do generally. Let's revert to a slightly less efficient but correct logic:
+                # Pre-calculate C_vmax for all undecided blocks and E for all undecided blocks.
+                C_vmax = (2.0 / (7.0 * kappa * V_max + epsilon)) - (V_max.pow(2) / 7.0)
+                E = torch.sum(x_abs.pow(2), dim=axis, keepdim=True)
 
-    return minus_exp_clipped.to(torch.int)
+                s3_pass = (E > C_vmax) & undecided_mask
+                proceed_mask[s3_pass] = True
+
+    # --- Final Decision ---
+    # Default minus_exp is 0.
+    # import pdb; pdb.set_trace()
+    minus_exp_final = torch.zeros_like(V_max_aggressive)
+    # Use the aggressive value only for blocks that passed the heuristic.
+    minus_exp_final = torch.where(proceed_mask, 1, 0)
+    # import pdb; pdb.set_trace()
+    # print(f"minus_exp_final: {minus_exp_final}")
+
+    return minus_exp_final
 
 
 if __name__ == '__main__':
-    A = torch.load("data/bf16/20250923_100434_0548_iter000_linear_L1_backward_pre_linear_bf16_rank00_group000_input.pt", map_location='cpu')['tensor'].cuda()
-    minus_exp_list = [None,0,1]
+    A = torch.load("data/bf16/20250923_100142_0001_iter000_linear_L1_forward_pre_linear_bf16_rank00_group000_input.pt", map_location='cpu')['tensor'].cuda()
+    B = torch.load("data/bf16/20250923_100142_0002_iter000_linear_L1_forward_pre_linear_bf16_rank00_group000_weight.pt", map_location='cpu')['tensor'].cuda() 
+    # Test different minus_exp settings including 'auto' with different heuristic levels
+    test_settings = [0, 1, ('auto', 1), ('auto', 2), ('auto', 3)]
+    # test_settings = [None, 0, 1, ('auto', 1), ('auto', 2), ('auto', 3)]
     block_size_list = [32,16]
-    for minus_exp in minus_exp_list:
+    
+    for setting in test_settings:
         for block_size in block_size_list:
-            print(f"minus_exp: {minus_exp}, block_size: {block_size}")
-            mxfp8_A = _quantize_mx(A, scale_bits=8, elem_format='fp4_e2m1', shared_exp_method="max", axes=-1, block_size=block_size, round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp)
+            if isinstance(setting, tuple):
+                minus_exp, level = setting
+            else:
+                minus_exp, level = setting, None
+
+            print(f"minus_exp: {minus_exp}, heuristic_level: {level}, block_size: {block_size}")
+            
+            # Test Matrix A
+            mxfp8_A = _quantize_mx(A, scale_bits=8, elem_format='fp4_e2m1', shared_exp_method="max", axes=-1, 
+                                   block_size=block_size, round="nearest", flush_fp32_subnorms=False, 
+                                   minus_exp=minus_exp, heuristic_level=level)
             loss_A = torch.mean((A - mxfp8_A) ** 2)
             print(f"loss_A: {loss_A}")
-            
-            # print(f"A_shape:{A.shape},A_max:{torch.max(A)},A_min:{torch.min(A)}")
-            B = torch.load("data/bf16/20250923_100434_0549_iter000_linear_L1_backward_pre_linear_bf16_rank00_group000_weight.pt", map_location='cpu')['tensor'].cuda() 
-            mxfp8_B = _quantize_mx(B, scale_bits=8, elem_format='fp4_e2m1', shared_exp_method="max", axes=-1, block_size=block_size, round="nearest", flush_fp32_subnorms=False, minus_exp=minus_exp)
+
+            # Test Matrix B
+            mxfp8_B = _quantize_mx(B, scale_bits=8, elem_format='fp4_e2m1', shared_exp_method="max", axes=-1, 
+                                   block_size=block_size, round="nearest", flush_fp32_subnorms=False, 
+                                   minus_exp=minus_exp, heuristic_level=level)
             loss_B = torch.mean((B - mxfp8_B) ** 2)
             print(f"loss_B: {loss_B}")
-            # print(f"B_shape:{B.shape},B_max:{torch.max(B)},B_min:{torch.min(B)}")
 
-            C_mxfp8 = mxfp_matmul(A,B,block_size=block_size,minus_exp=minus_exp)
+            # Test MatMul
+            C_mxfp8 = mxfp_matmul(A, B, elem_format='fp4_e2m1', block_size=block_size, minus_exp=minus_exp, heuristic_level=level)
             C_bf16 = torch.matmul(A,B).to(torch.bfloat16)
             loss_mxfp = torch.mean((C_bf16 - C_mxfp8) ** 2)
-                
-            # print(f"C_shape:{C_mxfp8.shape},C_mxfp8_max:{torch.max(C_mxfp8)},C_mxfp8_min:{torch.min(C_mxfp8)}")
             print(f"loss_mxfp: {loss_mxfp}")
+            print("-" * 30)
