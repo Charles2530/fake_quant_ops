@@ -254,6 +254,31 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
                 shared_exp_method=method, axes=axes, block_size=32, 
                 round="nearest", flush_fp32_subnorms=False
             )
+             # Ensure minus_exp has the same shape as shared_exp
+            if isinstance(minus_exp_result, torch.Tensor):
+                # If shapes don't match, try to reshape
+                if minus_exp_result.shape != shared_exp.shape:
+                    # Try to squeeze extra trailing dimensions of size 1
+                    while (minus_exp_result.ndim > shared_exp.ndim and 
+                           minus_exp_result.shape[-1] == 1):
+                        minus_exp_result = minus_exp_result.squeeze(-1)
+                    # If still don't match, try to view or broadcast
+                    if minus_exp_result.shape != shared_exp.shape:
+                        try:
+                            minus_exp_result = minus_exp_result.view(shared_exp.shape)
+                        except:
+                            # If view fails, try broadcast_to
+                            minus_exp_result = torch.broadcast_to(minus_exp_result, shared_exp.shape).clone()
+                minus_exp = minus_exp_result
+            else:
+                # Scalar value, create tensor with shared_exp shape
+                minus_exp = torch.full(shared_exp.shape, minus_exp_result, dtype=shared_exp.dtype, device=shared_exp.device)
+        elif minus_exp == "auto_reverse":
+            minus_exp_result = calculate_minus_mse_exp_reverse(
+                A, scale_bits=8, elem_format=elem_format, 
+                shared_exp_method=method, axes=axes, block_size=32, 
+                round="nearest", flush_fp32_subnorms=False
+            )
             # Ensure minus_exp has the same shape as shared_exp
             if isinstance(minus_exp_result, torch.Tensor):
                 # If shapes don't match, try to reshape
@@ -632,6 +657,170 @@ def calculate_minus_mse_exp(
         # No blocks, compare overall MSE
         if mse_half_scale < mse_scale:
             best_minus_exp = 1
+        else:
+            best_minus_exp = 0
+        # Return scalar value when block_size=0, similar to reference code
+        best_minus_exp_per_block = best_minus_exp
+    
+    return best_minus_exp_per_block
+
+def calculate_minus_mse_exp_reverse(
+    A,
+    scale_bits,
+    elem_format,
+    shared_exp_method="max",
+    axes=None,
+    block_size=0,
+    round="nearest",
+    flush_fp32_subnorms=False,
+):
+    """
+    Calculate optimal minus_exp based on MSE comparison between minus_exp=0 and minus_exp=-1.
+    
+    This function quantizes the input tensor with two different minus_exp values (0 and -1),
+    compares their MSE per block, and returns the optimal minus_exp for each block.
+    
+    Args:
+        A: Input tensor to quantize
+        scale_bits: Number of bits for scale
+        elem_format: Element format (e.g., 'fp8_e5m2', 'fp4_e2m1')
+        shared_exp_method: Method for shared exponent calculation ("max" or "none")
+        axes: Axes along which to calculate shared exponents
+        block_size: Block size for block-wise quantization (0 means no blocking)
+        round: Rounding method
+        flush_fp32_subnorms: Whether to flush FP32 subnormals
+    
+    Returns:
+        best_minus_exp_per_block: Tensor with optimal minus_exp for each block (-1 or 0)
+                                 If block_size=0, returns a scalar (0 or -1)
+    """
+    if elem_format == None:
+        # If no quantization format, return 0 (no minus_exp adjustment needed)
+        return 0
+    
+    assert(scale_bits > 0)
+    if axes is None:
+        axes = []
+    else:
+        axes = [axes] if type(axes) == int else axes
+        axes = [x + A.ndim if x < 0 else x for x in axes]
+    
+    ebits, mbits, emax, max_norm, _ = _get_format_params(elem_format)
+    
+    # Check if axes are valid for current A shape
+    # If axes contain values >= A.ndim, it means A is already reshaped and axes are already adjusted
+    if block_size > 0 and axes:
+        axes_valid = all(0 <= ax < A.ndim for ax in axes)
+        if axes_valid:
+            # A is not reshaped yet, do reshape
+            try:
+                A_reshaped, axes_reshaped, orig_shape, padded_shape = _reshape_to_blocks(
+                    A, axes, block_size
+                )
+                shared_exp_axes = [x + 1 for x in axes_reshaped]
+            except (IndexError, AssertionError):
+                # If reshape fails (e.g., axes out of range), assume A is already reshaped
+                A_reshaped = A
+                shared_exp_axes = axes
+        else:
+            # Axes are out of range, assume A is already reshaped
+            A_reshaped = A
+            shared_exp_axes = axes
+    else:
+        A_reshaped = A
+        shared_exp_axes = axes if axes is not None else []
+    
+    # Calculate shared_exp with minus_exp=0
+    shared_exp = _shared_exponents(
+        A_reshaped, method=shared_exp_method, axes=shared_exp_axes, ebits=0,
+        elem_format=elem_format, minus_exp=0, heuristic_level=None,
+    )
+    
+    if flush_fp32_subnorms:
+        A_reshaped = A_reshaped * (shared_exp > -FP32_EXPONENT_BIAS).type(A.dtype)
+    
+    shared_exp = shared_exp - emax
+    
+    scale_emax = 2**(scale_bits-1) - 1
+    shared_exp[shared_exp > scale_emax] = float("NaN")
+    shared_exp[shared_exp < -scale_emax] = -scale_emax
+    
+    # Quantize with minus_exp=0 (original scale)
+    q_A = A_reshaped / (2**shared_exp)
+    q_A = _quantize_elemwise_core(
+        q_A, mbits, ebits, max_norm, round=round,
+        allow_denorm=True, saturate_normals=True
+    )
+    q_A = q_A * (2**shared_exp)
+    
+    # Calculate MSE per block with minus_exp=0
+    if block_size > 0:
+        squared_error = (A_reshaped - q_A) ** 2
+        mse_per_block = squared_error
+        for axis in shared_exp_axes:
+            mse_per_block = torch.mean(mse_per_block, dim=axis, keepdim=True)
+    else:
+        mse_scale = torch.mean((A_reshaped - q_A) ** 2).item()
+        mse_per_block = None
+    
+    # ========== Test with scale_exp - 1 (minus_exp = -1) ==========
+    # Create half_scale shared_exp by subtracting 1
+    shared_exp_half = shared_exp.clone() + 1
+    
+    # Clamp again to ensure it's within range
+    shared_exp_half[shared_exp_half > scale_emax] = float("NaN")
+    shared_exp_half[shared_exp_half < -scale_emax] = -scale_emax
+    
+    # Apply scaling with half_scale
+    q_A_half = A_reshaped / (2**shared_exp_half)
+    
+    # Quantize element-wise
+    q_A_half = _quantize_elemwise_core(
+        q_A_half, mbits, ebits, max_norm, round=round,
+        allow_denorm=True, saturate_normals=True
+    )
+    
+    # Undo scaling
+    q_A_half = q_A_half * (2**shared_exp_half)
+    
+    # Calculate MSE per block with minus_exp=-1
+    if block_size > 0:
+        squared_error_half = (A_reshaped - q_A_half) ** 2
+        mse_per_block_half = squared_error_half
+        for axis in shared_exp_axes:
+            mse_per_block_half = torch.mean(mse_per_block_half, dim=axis, keepdim=True)
+    else:
+        mse_half_scale = torch.mean((A_reshaped - q_A_half) ** 2).item()
+        mse_per_block_half = None
+    
+    # Select best minus_exp per block based on MSE comparison
+    if block_size > 0 and mse_per_block is not None and mse_per_block_half is not None:
+        # Compare MSE per block and select the better one
+        # mse_per_block_half < mse_per_block means minus_exp=-1 is better
+        # Otherwise, minus_exp=0 is better
+        better_is_half = mse_per_block_half < mse_per_block
+        
+        # Create best_minus_exp_per_block with the same shape as shared_exp
+        # Ensure better_is_half has the same shape as shared_exp
+        if better_is_half.shape != shared_exp.shape:
+            # Try to match shapes by squeezing extra trailing dimensions
+            if better_is_half.ndim > shared_exp.ndim:
+                while (better_is_half.ndim > shared_exp.ndim and 
+                       better_is_half.shape[-1] == 1):
+                    better_is_half = better_is_half.squeeze(-1)
+            # If still don't match, try broadcast
+            if better_is_half.shape != shared_exp.shape:
+                better_is_half = torch.broadcast_to(better_is_half, shared_exp.shape).clone()
+        
+        best_minus_exp_per_block = torch.where(
+            better_is_half,
+            torch.full_like(shared_exp, -1.0, dtype=torch.float),
+            torch.zeros_like(shared_exp)
+        )
+    else:
+        # No blocks, compare overall MSE
+        if mse_half_scale < mse_scale:
+            best_minus_exp = -1
         else:
             best_minus_exp = 0
         # Return scalar value when block_size=0, similar to reference code
