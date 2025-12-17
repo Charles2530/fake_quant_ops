@@ -717,7 +717,7 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
             shared_exp, _ = torch.max(torch.abs(shared_exp), dim=axis, keepdim=True)
     
     # Convert to log2 and floor (same as _shared_exponents with minus_exp=None)
-    shared_exp = torch.floor(
+    shared_exp = torch.ceil(
         torch.log2(
             shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
         )
@@ -741,21 +741,34 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
     shared_exp[shared_exp < -scale_emax] = -scale_emax
     
     # Apply scaling (same as _quantize_mx line 430)
-    A = A / (2**shared_exp)
+    q_A = A / (2**shared_exp)
     
     # Analyze overflow/underflow before quantization
     overflow_underflow_analysis = _analyze_overflow_underflow_before_quantization(
-        A, elem_format, mbits, ebits, max_norm, verbose=False
+        q_A, elem_format, mbits, ebits, max_norm, verbose=False
     )
     
     # Quantize element-wise (same as _quantize_mx lines 433-435)
-    A = _quantize_elemwise_core(
-        A, mbits, ebits, max_norm, round='nearest',
+    q_A = _quantize_elemwise_core(
+        q_A, mbits, ebits, max_norm, round='nearest',
         allow_denorm=True, saturate_normals=True
     )
     
     # Undo scaling (same as _quantize_mx line 437)
-    A = A * (2**shared_exp)
+    q_A = q_A * (2**shared_exp)
+    # calc MSE in per block with A and q_A(block-size numbers)
+    if block_size > 0:
+        # Calculate squared error
+        squared_error = (A - q_A) ** 2
+        # Calculate MSE per block by averaging over block_size dimensions
+        # Use shared_exp_axes which correspond to the block dimensions
+        # (shared_exp_axes = [x + 1 for x in axes] when block_size > 0)
+        mse_per_block = squared_error
+        for axis in shared_exp_axes:
+            mse_per_block = torch.mean(mse_per_block, dim=axis, keepdim=True)
+    else:
+        # No blocks, calculate overall MSE
+        mse_per_block = torch.mean((A - q_A) ** 2)
     
     # Undo tile reshaping (same as _quantize_mx lines 440-441)
     if block_size > 0:

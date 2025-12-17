@@ -133,58 +133,133 @@ def _get_representable_values(elem_format):
             
     return sorted(list(values))
 
-def _calculate_kappa(elem_format: str, distribution: str='gaussian') -> float:
-    """
-    Calculates the format-specific constant kappa based on the quantization points
-    and the data distribution, as described in the paper.
-    """
-    # 1. Get the positive, non-zero representable values (q_i)
+# def _calculate_kappa(elem_format: str, distribution: str='gaussian') -> float:
+#     """
+#     Calculates the format-specific constant kappa based on the quantization points
+#     and the data distribution, as described in the paper.
+#     """
+#     # 1. Get the positive, non-zero representable values (q_i)
+#     q_values = _get_representable_values(elem_format)
+#     # import pdb; pdb.set_trace()
+#     if not q_values:
+#         return 2.0 # Default for non-float formats
+
+#     # 2. Define the probability density function p(x) for the distribution
+#     if distribution.lower() == 'gaussian':
+#         def p(x):
+#             return (1.0 / math.sqrt(2 * math.pi)) * math.exp(-x**2 / 2.0)
+#     else:
+#         # For now, only Gaussian is implemented in detail
+#         raise ValueError(f"Detailed kappa calculation for distribution '{distribution}' is not implemented.")
+
+#     # 3. Calculate the total rounding error D_round
+#     total_error = 0.0
+#     q_with_zero = [0.0] + q_values
+
+#     # Iterate through each quantization point to calculate its error contribution
+#     for i in range(1, len(q_with_zero)):
+#         q_i = q_with_zero[i]
+        
+#         # 4. Calculate left and right intervals (delta_L, delta_R)
+#         delta_L = q_i - q_with_zero[i-1]
+        
+#         if i == len(q_with_zero) - 1:
+#             # For the last point, assume the right interval is symmetric to the left
+#             # This is a simplification for the clipping region
+#             delta_R = delta_L
+#         else:
+#             delta_R = q_with_zero[i+1] - q_i
+            
+#         # 5. Calculate error contribution using the formula from the paper
+#         # D_round ≈ Σ p(q_i) * ( (Δ_i,R³ + Δ_i,L³) / 24 )
+#         prob = p(q_i)
+#         error_contrib = prob * (delta_L**3 + delta_R**3) / 24.0
+#         total_error += error_contrib
+        
+#     # 6. Multiply by 2 for negative values and return kappa
+#     # For S=1 and Energy=1, kappa is approximately D_round
+#     kappa = 2.0 * total_error
+#     return kappa
+
+# if __name__ == '__main__':
+#     print("Demonstrating the new _calculate_kappa function:")
+    
+#     # Example for fp4_e2m1 as discussed
+#     kappa_fp4 = _calculate_kappa('fp4_e2m1', 'gaussian')
+#     print(f"Calculated kappa for fp4_e2m1 (Gaussian): {kappa_fp4}")
+#     kappa_fp8_e4m3 = _calculate_kappa('fp8_e4m3', 'gaussian')
+#     print(f"Calculated kappa for fp8_e4m3 (Gaussian): {kappa_fp8_e4m3}")
+#     kappa_fp8_e5m2 = _calculate_kappa('fp8_e5m2', 'gaussian')
+#     print(f"Calculated kappa for fp8_e5m2 (Gaussian): {kappa_fp8_e5m2}")
+
+
+# 新增一个缓存来存储预计算的 Kappa 常量
+_KAPPA_CONSTANTS_CACHE = {}
+
+def _get_kappa_constants(elem_format: str,distribution: str='gaussian'):
+    if type(elem_format) is str:
+        elem_format = ElemFormat.from_str(elem_format)
+    
+    # 如果缓存中已有结果，直接返回
+    if elem_format in _KAPPA_CONSTANTS_CACHE:
+        return _KAPPA_CONSTANTS_CACHE[elem_format]
+
+    # 获取量化值
     q_values = _get_representable_values(elem_format)
-    # import pdb; pdb.set_trace()
     if not q_values:
-        return 2.0 # Default for non-float formats
+        # 对于非浮点格式，缓存一个空列表并返回
+        _KAPPA_CONSTANTS_CACHE[elem_format] = []
+        return []
 
-    # 2. Define the probability density function p(x) for the distribution
-    if distribution.lower() == 'gaussian':
-        def p(x):
-            return (1.0 / math.sqrt(2 * math.pi)) * math.exp(-x**2 / 2.0)
-    else:
-        # For now, only Gaussian is implemented in detail
-        raise ValueError(f"Detailed kappa calculation for distribution '{distribution}' is not implemented.")
-
-    # 3. Calculate the total rounding error D_round
-    total_error = 0.0
+    constants = []
     q_with_zero = [0.0] + q_values
-
-    # Iterate through each quantization point to calculate its error contribution
+    
+    # 循环一次，计算所有仅与格式相关的常量
     for i in range(1, len(q_with_zero)):
         q_i = q_with_zero[i]
         
-        # 4. Calculate left and right intervals (delta_L, delta_R)
         delta_L = q_i - q_with_zero[i-1]
         
         if i == len(q_with_zero) - 1:
-            # For the last point, assume the right interval is symmetric to the left
-            # This is a simplification for the clipping region
-            delta_R = delta_L
+            delta_R = delta_L  # 最后一个点的简化处理
         else:
             delta_R = q_with_zero[i+1] - q_i
             
-        # 5. Calculate error contribution using the formula from the paper
-        # D_round ≈ Σ p(q_i) * ( (Δ_i,R³ + Δ_i,L³) / 24 )
-        prob = p(q_i)
-        error_contrib = prob * (delta_L**3 + delta_R**3) / 24.0
-        total_error += error_contrib
+        # C_i 是仅依赖于数据格式的常量
+        C_i = (delta_L**3 + delta_R**3) / 24.0
+        constants.append((q_i, C_i))
         
-    # 6. Multiply by 2 for negative values and return kappa
-    # For S=1 and Energy=1, kappa is approximately D_round
+    # 将结果存入缓存
+    _KAPPA_CONSTANTS_CACHE[elem_format] = constants
+    return constants
+
+def _calculate_kappa(elem_format: str, distribution: str='gaussian', miu: float = 0.0, gamma: float = 1.0) -> float:
+    kappa_constants = _get_kappa_constants(elem_format,distribution)
+    if not kappa_constants:
+        return 2.0  
+    pdf_norm_factor = 1.0 / (math.sqrt(gamma * 2 * math.pi))
+
+    total_error = 0.0
+    for q_i, C_i in kappa_constants:
+        # exponent = -((q_i - miu)**2) / (2 * gamma)
+        exponent = -(q_i**2 - 2*miu*q_i + miu**2) / (2 * gamma)
+        prob = pdf_norm_factor * math.exp(exponent)
+        
+        total_error += prob * C_i
+        
     kappa = 2.0 * total_error
     return kappa
 
 if __name__ == '__main__':
-    print("Demonstrating the new _calculate_kappa function:")
+    kappa1 = _calculate_kappa('fp4_e2m1','gaussian', miu=0.2, gamma=1.0)
+    v1=math.pow(2/kappa1,1/3)
+    print(f"Calculated kappa for fp4_e2m1 (μ=0.2, γ=1): {kappa1}, v1: {v1}")
     
-    # Example for fp4_e2m1 as discussed
-    kappa_fp4 = _calculate_kappa('fp4_e2m1', 'gaussian')
-    print(f"Calculated kappa for fp4_e2m1 (Gaussian): {kappa_fp4}")
+    kappa2 = _calculate_kappa('fp4_e2m1','gaussian', miu=0.5, gamma=1.0)
+    v2=math.pow(2/kappa2,1/3)
+    print(f"Calculated kappa for fp4_e2m1 (μ=0.5, γ=1): {kappa2}, v2: {v2}")
 
+    # 第二次调用相同格式时，会直接使用缓存，速度更快
+    kappa3 = _calculate_kappa('fp4_e2m1','gaussian', miu=5, gamma=1.0)
+    v3=math.pow(2/kappa3,1/3)
+    print(f"Calculated kappa for fp4_e2m1 (μ=5, γ=1): {kappa3}, v3: {v3}")
