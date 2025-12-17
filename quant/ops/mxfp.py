@@ -273,7 +273,7 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
             else:
                 # Scalar value, create tensor with shared_exp shape
                 minus_exp = torch.full(shared_exp.shape, minus_exp_result, dtype=shared_exp.dtype, device=shared_exp.device)
-        elif minus_exp == "auto_reverse":
+        elif minus_exp == "auto-reverse":
             minus_exp_result = calculate_minus_mse_exp_reverse(
                 A, scale_bits=8, elem_format=elem_format, 
                 shared_exp_method=method, axes=axes, block_size=32, 
