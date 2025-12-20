@@ -213,7 +213,7 @@ def _quantize_elemwise_core(A, bits, exp_bits, max_norm, round='nearest',
                 requires_grad=sparse_A.requires_grad)
     return out
 
-def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2', minus_exp=None, heuristic_level=None):
+def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2', minus_exp=None,minus_level=1.0, heuristic_level=None):
     """
     Get shared exponents for the passed matrix A.
     Args:
@@ -251,7 +251,7 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
                 minus_exp_result = calculate_minus_mse_exp(
                     A, scale_bits=8, elem_format=elem_format, 
                     shared_exp_method=method, axes=axes, block_size=32, 
-                    round="nearest", flush_fp32_subnorms=False,minus_level=1.0
+                    round="nearest", flush_fp32_subnorms=False,minus_level=minus_level
                 )
             elif minus_exp == "auto-reverse":
                 minus_exp_result = calculate_minus_mse_exp(
@@ -377,6 +377,7 @@ def _quantize_mx(
     round="nearest",
     flush_fp32_subnorms=False,
     minus_exp=None,
+    minus_level=1.0,
     heuristic_level=None
 ):
     """Function used for MX* quantization
@@ -403,7 +404,7 @@ def _quantize_mx(
     shared_exp_axes = [x + 1 for x in axes] if block_size > 0 else axes
     shared_exp = _shared_exponents(
         A_reshaped, method=shared_exp_method, axes=shared_exp_axes, ebits=0,elem_format=elem_format, 
-        minus_exp=minus_exp, heuristic_level=heuristic_level,
+        minus_exp=minus_exp, minus_level=minus_level, heuristic_level=heuristic_level,
     )
 
     if flush_fp32_subnorms:

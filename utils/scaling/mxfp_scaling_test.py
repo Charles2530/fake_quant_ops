@@ -15,9 +15,11 @@ import logging
 from datetime import datetime
 
 # Add the parent directory to path to import mxfp module
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Go up three levels: utils/scaling -> utils -> project_root
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, project_root)
 
-from fake_quant_ops.quant.ops.mxfp import _quantize_mx, _get_format_params, ElemFormat
+from quant.ops.mxfp import _quantize_mx, _get_format_params, ElemFormat
 
 def setup_logging(output_dir, tensor_name, elem_format):
     """
@@ -223,36 +225,62 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
     log_func(f"Tensor absolute value range: [{tensor_abs_min:.6e}, {tensor_abs_max:.6e}]")
     log_func(f"Format range: max_norm={max_norm:.6e}, min_norm={min_norm:.6e}")
     log_func(f"Calculated alignment (reference): max_align={max_align_exp:.2f}, min_align={min_align_exp:.2f}")
-    log_func(f"Testing integer scaling levels from {max_scale_exp:.2f} to {min_scale_exp:.2f}")
     log_func(f"Element format: {elem_format} (e{ebits}m{mbits})")
     log_func(f"Scale bits: {scale_bits}")
     log_func(f"Block size: {block_size} (0 means no tiling)")
     log_func(f"Axes: {axes}")
     log_func("-" * 60)
     
-    for i, scale_exp in enumerate(scale_exponents):
-        log_func(f"Testing scale exponent {scale_exp} ({i+1}/{len(scale_exponents)})...")
-        
-        # Create a custom quantize function with fixed scale exponent
-        quantized_tensor, overflow_underflow_analysis = quantize_with_fixed_scale(
-            input_tensor, elem_format, scale_bits, scale_exp, 
-            ebits, mbits, max_norm, axes=axes, block_size=block_size
-        )
-        
-        # Calculate metrics
-        metrics = calculate_metrics(input_tensor, quantized_tensor)
-        
-        # Store results
-        results['metrics'][f'scale_{i}'] = {
-            'scale_exponent': float(scale_exp),
-            'metrics': metrics,
-            'overflow_underflow_analysis': overflow_underflow_analysis
-        }
-        
-        # Print current metrics
-        log_func(f"  MSE: {metrics['mse']:.6e}, "
-                 f"Cosine Sim: {metrics['cosine_similarity']:.6f}, "
-                 f"PSNR: {metrics['psnr']:.2f} dB")
+    # Use the calculated scale_exp (what mxfp.py would use by default)
+    scale_exp = max_align_exp
+    
+    log_func(f"Testing minus_level combinations with scale_exp={scale_exp:.2f}...")
+    
+    # Test different minus_level combinations
+    quantized_tensor, mse_info = quantize_with_fixed_scale(
+        input_tensor, elem_format, scale_bits, scale_exp, 
+        ebits, mbits, max_norm, axes=axes, block_size=block_size
+    )
+    
+    # Calculate metrics
+    metrics = calculate_metrics(input_tensor, quantized_tensor)
+    
+    # Store results
+    results['metrics']['scale_0'] = {
+        'scale_exponent': float(scale_exp),
+        'metrics': metrics,
+        'mse_info': mse_info
+    }
+    results['scale_exponents'] = [scale_exp]
+    
+    # Print current metrics
+    log_func(f"  MSE (original scale, minus_level=0): {mse_info['mse_scale']:.6e}")
+    
+    # Calculate best MSE from mse_by_minus_level
+    if 'mse_by_minus_level' in mse_info and mse_info['mse_by_minus_level']:
+        all_mse = [mse_info['mse_scale']] + list(mse_info['mse_by_minus_level'].values())
+        best_mse = min(all_mse)
+        log_func(f"  Best MSE: {best_mse:.6e}")
+    else:
+        best_mse = mse_info['mse_scale']
+        log_func(f"  Best MSE: {best_mse:.6e}")
+    
+    if 'best_minus_level' in mse_info:
+        log_func(f"  Best minus_level: {mse_info['best_minus_level']:.1f}")
+    
+    if 'tested_minus_levels' in mse_info and mse_info['tested_minus_levels']:
+        log_func(f"  Tested minus_levels: {mse_info['tested_minus_levels']}")
+    
+    # Print MSE for each minus_level
+    if 'mse_by_minus_level' in mse_info and mse_info['mse_by_minus_level']:
+        log_func(f"  MSE by minus_level:")
+        log_func(f"    minus_level=0: {mse_info['mse_scale']:.6e}")
+        for ml in sorted(mse_info['mse_by_minus_level'].keys()):
+            log_func(f"    minus_level={ml}: {mse_info['mse_by_minus_level'][ml]:.6e}")
+    
+    log_func(f"  Final MSE: {metrics['mse']:.6e}, "
+             f"Cosine Sim: {metrics['cosine_similarity']:.6f}, "
+             f"PSNR: {metrics['psnr']:.2f} dB")
     
     return results
 
@@ -661,8 +689,9 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
                              ebits, mbits, max_norm, axes=None, block_size=0):
     """
     Custom quantization function with fixed scale exponent.
-    This function simulates the exact behavior of mxfp.py _quantize_mx function,
-    including block_size support.
+    This function directly calls _quantize_mx with different minus_exp values
+    (obtained via calculate_minus_mse_exp with different minus_level values),
+    compares the MSE of each result with the original tensor, and selects the best one.
     
     Args:
         input_tensor (torch.Tensor): Input tensor
@@ -677,13 +706,21 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
         block_size (int): Block size for tiling
         
     Returns:
-        tuple: (quantized_tensor, overflow_underflow_analysis)
+        tuple: (quantized_tensor, overflow_underflow_analysis, mse_info)
+               where mse_info is a dict containing:
+               - mse_scale: MSE using scale_exp (original scale)
+               - mse_half_scale: MSE using scale_exp - 1 (for backward compatibility)
+               - best_mse_overall: Best MSE after per-block selection
+               - blocks_using_half_scale: Number of blocks using non-zero minus_level
+               - total_blocks: Total number of blocks
+               - half_scale_ratio: Ratio of blocks using non-zero minus_level
+               - best_minus_level: The minus_level value that achieved best MSE
+               - tested_minus_levels: List of all tested minus_level values
     """
-    from fake_quant_ops.quant.ops.mxfp import (
-        _quantize_elemwise_core, _reshape_to_blocks, _undo_reshape_to_blocks,
-        _get_min_norm, FP32_MIN_NORMAL
+    from quant.ops.mxfp import (
+        _quantize_mx, calculate_minus_mse_exp, _shared_exponents, _get_format_params
     )
-    from fake_quant_ops.utils.saver.mxfp_saver import _analyze_overflow_underflow_before_quantization
+    from utils.saver.mxfp_saver import _analyze_overflow_underflow_before_quantization
     
     A = input_tensor.clone()
     
@@ -694,247 +731,223 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
         axes = [axes] if type(axes) == int else axes 
         axes = [x + A.ndim if x < 0 else x for x in axes]  # convert negative axes to positive axes
     
-    # Calculate emax
-    emax = 2**(ebits - 1) - 1 if ebits > 0 else 0
+    # Calculate emax and other format parameters
+    ebits, mbits, emax, max_norm, _ = _get_format_params(elem_format)
     
-    # Perform tiling to the hardware vector size (same as _quantize_mx)
-    orig_shape = None
-    padded_shape = None
-    if block_size > 0:
-        A, axes, orig_shape, padded_shape = _reshape_to_blocks(A, axes, block_size)
-    
-    # Calculate shared_exp_axes (same as _quantize_mx)
-    # add 1 to share exp for the same block
-    shared_exp_axes = [x + 1 for x in axes] if block_size > 0 else axes
-    
-    # Calculate shared_exp using the same method as _quantize_mx
-    # In _quantize_mx, shared_exp is calculated from max absolute value
-    if shared_exp_axes is None or len(shared_exp_axes) == 0:
-        shared_exp = torch.max(torch.abs(A))
-    else:
-        shared_exp = A
-        for axis in shared_exp_axes:
-            shared_exp, _ = torch.max(torch.abs(shared_exp), dim=axis, keepdim=True)
-    
-    # Convert to log2 and floor (same as _shared_exponents with minus_exp=None)
-    shared_exp = torch.ceil(
-        torch.log2(
-            shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
-        )
-    )
-    
-    # Now adjust shared_exp to achieve the desired scale_exp
-    # In _quantize_mx: shared_exp = shared_exp - emax, then A = A / (2**shared_exp)
-    # We want: (shared_exp - emax) = scale_exp
-    # So: shared_exp = scale_exp + emax
-    # But we need to maintain the block structure, so we set all blocks to the same value
-    # Keep the shape of shared_exp but set all values to target_shared_exp
-    target_shared_exp = scale_exp + emax
-    shared_exp = torch.full_like(shared_exp, target_shared_exp, dtype=shared_exp.dtype)
-    
-    # Offset by emax (same as _quantize_mx line 424)
-    shared_exp = shared_exp - emax
-    
-    # Clamp shared_exp to scale_bits range (same as _quantize_mx lines 426-428)
+    # Calculate maximum minus_level to test
     scale_emax = 2**(scale_bits-1) - 1
-    shared_exp[shared_exp > scale_emax] = float("NaN")
-    shared_exp[shared_exp < -scale_emax] = -scale_emax
     
-    # Apply scaling (same as _quantize_mx line 430)
-    q_A = A / (2**shared_exp)
-    
-    # Analyze overflow/underflow before quantization
-    overflow_underflow_analysis = _analyze_overflow_underflow_before_quantization(
-        q_A, elem_format, mbits, ebits, max_norm, verbose=False
+    # ========== Test with scale_exp (original scale, minus_level=0) ==========
+    # Directly call _quantize_mx with minus_exp=None
+    q_A_base = _quantize_mx(
+        A, scale_bits=scale_bits, elem_format=elem_format,
+        shared_exp_method="max", axes=axes, block_size=block_size,
+        round="nearest", flush_fp32_subnorms=False,
+        minus_exp=0, heuristic_level=None
     )
     
-    # Quantize element-wise (same as _quantize_mx lines 433-435)
-    q_A = _quantize_elemwise_core(
-        q_A, mbits, ebits, max_norm, round='nearest',
-        allow_denorm=True, saturate_normals=True
-    )
+    # Calculate MSE with original tensor
+    mse_scale = torch.mean((A - q_A_base) ** 2).item()
     
-    # Undo scaling (same as _quantize_mx line 437)
-    q_A = q_A * (2**shared_exp)
-    # calc MSE in per block with A and q_A(block-size numbers)
-    if block_size > 0:
-        # Calculate squared error
-        squared_error = (A - q_A) ** 2
-        # Calculate MSE per block by averaging over block_size dimensions
-        # Use shared_exp_axes which correspond to the block dimensions
-        # (shared_exp_axes = [x + 1 for x in axes] when block_size > 0)
-        mse_per_block = squared_error
-        for axis in shared_exp_axes:
-            mse_per_block = torch.mean(mse_per_block, dim=axis, keepdim=True)
-    else:
-        # No blocks, calculate overall MSE
-        mse_per_block = torch.mean((A - q_A) ** 2)
+    # Initialize results storage
+    tested_minus_levels = []
+    mse_results = {}  # Store MSE for each minus_level
+    best_mse = mse_scale
+    best_minus_level = 0
+    best_q_A = q_A_base
     
-    # Undo tile reshaping (same as _quantize_mx lines 440-441)
-    if block_size > 0:
-        A = _undo_reshape_to_blocks(A, padded_shape, orig_shape, axes)
+    # Test different minus_level values
+    for minus_level in range(1, 8):
+        tested_minus_levels.append(minus_level)
+        
+        # Call _quantize_mx with auto minus_exp and specified minus_level
+        q_A_test = _quantize_mx(
+            A, scale_bits=scale_bits, elem_format=elem_format,
+            shared_exp_method="max", axes=axes, block_size=block_size,
+            round="nearest", flush_fp32_subnorms=False,
+            minus_exp="auto", minus_level=minus_level, heuristic_level=None
+        )
+        
+        # Calculate MSE with original tensor
+        mse_test = torch.mean((A - q_A_test) ** 2).item()
+        mse_results[minus_level] = mse_test
+        
+        # Update best result if this minus_level is better
+        if mse_test < best_mse:
+            best_mse = mse_test
+            best_minus_level = minus_level
+            best_q_A = q_A_test
     
-    return A, overflow_underflow_analysis
+    # Use best quantized tensor
+    q_A = best_q_A
+        
+    # Prepare MSE info
+    mse_info = {
+        'mse_scale': mse_scale,
+        'best_minus_level': float(best_minus_level),
+        'tested_minus_levels': tested_minus_levels,
+        'mse_by_minus_level': mse_results,
+    }
+    
+    return q_A, mse_info
 
-def plot_scaling_results(results, output_path):
+
+def plot_mse_by_minus_level(results, output_path):
     """
-    Create comprehensive plots showing scaling test results.
+    Plot beautiful MSE curve for different minus_level values.
     
     Args:
         results (dict): Results from test_scaling_levels
         output_path (Path): Output directory for plots
     """
-    scale_exponents = results['scale_exponents']
     elem_format = results['elem_format']
     
-    # Extract metrics for plotting
-    metrics_data = {}
-    for metric_name in ['mse', 'rmse', 'cosine_similarity', 'psnr', 'mae', 'max_abs_error', 'relative_error']:
-        metrics_data[metric_name] = []
-        for i in range(len(scale_exponents)):
-            scale_key = f'scale_{i}'
-            if scale_key in results['metrics']:
-                metrics_data[metric_name].append(results['metrics'][scale_key]['metrics'][metric_name])
+    # Get the single scale_exp result
+    scale_key = 'scale_0'
+    if scale_key not in results['metrics']:
+        return  # No data to plot
     
-    # Create figure with subplots
-    fig, axes = plt.subplots(3, 2, figsize=(15, 18))
-    fig.suptitle(f'MXFP Scaling Test Results - {elem_format.upper()}', fontsize=16, fontweight='bold')
+    mse_info = results['metrics'][scale_key].get('mse_info', {})
+    if 'mse_by_minus_level' not in mse_info or not mse_info['mse_by_minus_level']:
+        return  # No minus_level data
     
-    # Plot 1: MSE
-    axes[0, 0].semilogy(scale_exponents, metrics_data['mse'], 'b-o', linewidth=2, markersize=4)
-    axes[0, 0].set_xlabel('Scale Exponent')
-    axes[0, 0].set_ylabel('MSE (log scale)')
-    axes[0, 0].set_title('Mean Squared Error vs Scale Exponent')
-    axes[0, 0].grid(True, alpha=0.3)
+    # Collect MSE data
+    minus_level_mse = {}
+    # Add base case (minus_level=0)
+    minus_level_mse[0] = mse_info.get('mse_scale', 0)
+    # Add other minus_levels
+    for minus_level, mse in mse_info['mse_by_minus_level'].items():
+        minus_level_mse[minus_level] = mse
     
-    # Plot 2: Cosine Similarity
-    axes[0, 1].plot(scale_exponents, metrics_data['cosine_similarity'], 'g-o', linewidth=2, markersize=4)
-    axes[0, 1].set_xlabel('Scale Exponent')
-    axes[0, 1].set_ylabel('Cosine Similarity')
-    axes[0, 1].set_title('Cosine Similarity vs Scale Exponent')
-    axes[0, 1].grid(True, alpha=0.3)
-    axes[0, 1].set_ylim([0, 1])
+    if not minus_level_mse:
+        return  # No data to plot
     
-    # Plot 3: PSNR
-    # Handle infinite PSNR values
-    psnr_values = metrics_data['psnr']
-    psnr_finite = [p if p != float('inf') else 1000 for p in psnr_values]  # Cap at 1000 for plotting
+    # Get scale_exp and format info for title
+    scale_exp = results['metrics'][scale_key].get('scale_exponent', 0)
+    format_params = results.get('format_params', {})
     
-    axes[1, 0].plot(scale_exponents, psnr_finite, 'r-o', linewidth=2, markersize=4)
-    axes[1, 0].set_xlabel('Scale Exponent')
-    axes[1, 0].set_ylabel('PSNR (dB)')
-    axes[1, 0].set_title('Peak Signal-to-Noise Ratio vs Scale Exponent')
-    axes[1, 0].grid(True, alpha=0.3)
+    # Sort minus_levels
+    minus_levels = sorted(minus_level_mse.keys())
+    mse_values = [minus_level_mse[ml] for ml in minus_levels]
     
-    # Plot 4: MAE
-    axes[1, 1].semilogy(scale_exponents, metrics_data['mae'], 'm-o', linewidth=2, markersize=4)
-    axes[1, 1].set_xlabel('Scale Exponent')
-    axes[1, 1].set_ylabel('MAE (log scale)')
-    axes[1, 1].set_title('Mean Absolute Error vs Scale Exponent')
-    axes[1, 1].grid(True, alpha=0.3)
+    # Find best minus_level
+    best_idx = np.argmin(mse_values)
+    best_ml = minus_levels[best_idx]
+    best_mse = mse_values[best_idx]
     
-    # Plot 5: Maximum Absolute Error
-    axes[2, 0].semilogy(scale_exponents, metrics_data['max_abs_error'], 'c-o', linewidth=2, markersize=4)
-    axes[2, 0].set_xlabel('Scale Exponent')
-    axes[2, 0].set_ylabel('Max Absolute Error (log scale)')
-    axes[2, 0].set_title('Maximum Absolute Error vs Scale Exponent')
-    axes[2, 0].grid(True, alpha=0.3)
+    # Create beautiful plot with modern style
+    try:
+        plt.style.use('seaborn-v0_8-darkgrid')
+    except:
+        try:
+            plt.style.use('seaborn-darkgrid')
+        except:
+            plt.style.use('default')
     
-    # Plot 6: Relative Error
-    axes[2, 1].plot(scale_exponents, metrics_data['relative_error'], 'orange', marker='o', linewidth=2, markersize=4)
-    axes[2, 1].set_xlabel('Scale Exponent')
-    axes[2, 1].set_ylabel('Relative Error (%)')
-    axes[2, 1].set_title('Relative Error vs Scale Exponent')
-    axes[2, 1].grid(True, alpha=0.3)
+    fig, ax = plt.subplots(figsize=(12, 7))
     
-    # Add format information
-    format_params = results['format_params']
-    info_text = f"Format: {elem_format}\nE-bits: {format_params['ebits']}, M-bits: {format_params['mbits']}\n"
-    info_text += f"Max Normal: ±{format_params['max_norm']:.1e}\nMin Normal: {format_params['min_norm']:.1e}"
+    # Use a beautiful gradient color scheme (blue to purple)
+    colors = plt.cm.plasma(np.linspace(0.2, 0.8, len(minus_levels)))
     
-    fig.text(0.02, 0.02, info_text, fontsize=10, verticalalignment='bottom',
-             bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8))
+    # Plot main MSE curve with smooth gradient
+    line = ax.semilogy(minus_levels, mse_values, '-', linewidth=3.5, 
+                      color='#4A90E2', alpha=0.8, zorder=2, label='MSE Curve')
+    
+    # Plot points with gradient colors and white edges
+    for i, (ml, mse) in enumerate(zip(minus_levels, mse_values)):
+        marker_size = 14 if ml == best_ml else 11
+        ax.plot(ml, mse, 'o', markersize=marker_size, color=colors[i], 
+               markeredgecolor='white', markeredgewidth=2.5, zorder=4)
+    
+    # Highlight the best point with a prominent star
+    ax.plot(best_ml, best_mse, '*', markersize=30, color='#FF6B6B', 
+           markeredgecolor='white', markeredgewidth=3, 
+           label=f'Best: minus_level={best_ml}', zorder=6)
+    
+    # Add value annotations - only for key points to avoid clutter
+    # Annotate best point prominently
+    ax.annotate(f'MSE={best_mse:.2e}', 
+               xy=(best_ml, best_mse), 
+               xytext=(15, 20), 
+               textcoords='offset points',
+               fontsize=11, 
+               fontweight='bold',
+               bbox=dict(boxstyle='round,pad=0.6', facecolor='#FF6B6B', alpha=0.9, 
+                        edgecolor='white', linewidth=2),
+               arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.2', 
+                             color='#FF6B6B', lw=2.5),
+               color='white', zorder=7)
+    
+    # Annotate first and last points
+    if len(minus_levels) > 2:
+        # First point
+        if minus_levels[0] != best_ml:
+            ax.annotate(f'{mse_values[0]:.2e}', 
+                       xy=(minus_levels[0], mse_values[0]), 
+                       xytext=(0, -25), 
+                       textcoords='offset points',
+                       fontsize=9,
+                       ha='center',
+                       bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
+                               alpha=0.9, edgecolor='#4A90E2', linewidth=1.5),
+                       color='#2C3E50', fontweight='bold')
+        
+        # Last point
+        if minus_levels[-1] != best_ml:
+            ax.annotate(f'{mse_values[-1]:.2e}', 
+                       xy=(minus_levels[-1], mse_values[-1]), 
+                       xytext=(0, -25), 
+                       textcoords='offset points',
+                       fontsize=9,
+                       ha='center',
+                       bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
+                               alpha=0.9, edgecolor='#4A90E2', linewidth=1.5),
+                       color='#2C3E50', fontweight='bold')
+    
+    # Styling
+    ax.set_xlabel('Minus Level', fontsize=14, fontweight='bold', color='#333333')
+    ax.set_ylabel('MSE (log scale)', fontsize=14, fontweight='bold', color='#333333')
+    
+    # Enhanced title
+    title = f'MSE vs Minus Level Analysis - {elem_format.upper()}'
+    if format_params:
+        title += f'\nFormat: E{format_params.get("ebits", 0)}M{format_params.get("mbits", 0)} | Scale Exp: {scale_exp:.2f}'
+    ax.set_title(title, fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
+    
+    # Enhanced grid with subtle styling
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.7, color='#CCCCCC', zorder=1)
+    ax.set_axisbelow(True)
+    
+    # Set x-axis to show integer ticks with better formatting
+    ax.set_xticks(minus_levels)
+    ax.set_xticklabels([f'{ml}' for ml in minus_levels], fontsize=12, fontweight='bold')
+    ax.tick_params(axis='x', length=6, width=1.5, colors='#333333')
+    
+    # Format y-axis with better styling
+    ax.tick_params(axis='y', labelsize=11, colors='#333333')
+    ax.tick_params(axis='y', length=6, width=1.5)
+    
+    # Add legend with elegant styling
+    legend = ax.legend(loc='upper right', fontsize=12, framealpha=0.95, 
+                      fancybox=True, shadow=True, edgecolor='#CCCCCC', 
+                      facecolor='white', frameon=True)
+    legend.get_frame().set_linewidth(1.5)
+    
+    # Add subtle background color
+    ax.set_facecolor('#F8F9FA')
+    fig.patch.set_facecolor('white')
+    
+    # Add subtle border to the plot
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#E0E0E0')
+        spine.set_linewidth(1.5)
     
     plt.tight_layout()
-    plt.subplots_adjust(top=0.93, bottom=0.15)
     
-    # Save plot
-    plot_path = output_path / f'mxfp_scaling_test_{elem_format}.png'
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white')
+    # Save plot with high quality
+    plot_path = output_path / f'mxfp_mse_by_minus_level_{elem_format}.png'
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close()
-    
-    # This will be logged by the caller
-    pass
-    
-    # Create summary plot with key metrics
-    create_summary_plot(results, output_path)
-
-def create_summary_plot(results, output_path):
-    """Create a summary plot with the most important metrics."""
-    scale_exponents = results['scale_exponents']
-    elem_format = results['elem_format']
-    
-    # Extract key metrics
-    mse_values = []
-    cosine_sim_values = []
-    psnr_values = []
-    
-    for i in range(len(scale_exponents)):
-        scale_key = f'scale_{i}'
-        if scale_key in results['metrics']:
-            metrics = results['metrics'][scale_key]['metrics']
-            mse_values.append(metrics['mse'])
-            cosine_sim_values.append(metrics['cosine_similarity'])
-            psnr_values.append(metrics['psnr'])
-    
-    # Handle infinite PSNR values
-    psnr_finite = [p if p != float('inf') else 1000 for p in psnr_values]
-    
-    # Create summary plot
-    fig, ax1 = plt.subplots(figsize=(12, 8))
-    
-    # Plot MSE and PSNR on left y-axis
-    color1 = 'tab:blue'
-    ax1.set_xlabel('Scale Exponent', fontsize=12)
-    ax1.set_ylabel('MSE (log scale)', color=color1, fontsize=12)
-    line1 = ax1.semilogy(scale_exponents, mse_values, 'o-', color=color1, linewidth=2, markersize=6, label='MSE')
-    ax1.tick_params(axis='y', labelcolor=color1)
-    ax1.grid(True, alpha=0.3)
-    
-    # Create second y-axis for cosine similarity
-    ax2 = ax1.twinx()
-    color2 = 'tab:green'
-    ax2.set_ylabel('Cosine Similarity', color=color2, fontsize=12)
-    line2 = ax2.plot(scale_exponents, cosine_sim_values, 's-', color=color2, linewidth=2, markersize=6, label='Cosine Similarity')
-    ax2.tick_params(axis='y', labelcolor=color2)
-    ax2.set_ylim([0, 1])
-    
-    # Add PSNR as dashed line on ax1
-    ax1_2 = ax1.twinx()
-    ax1_2.spines['right'].set_position(('outward', 60))
-    color3 = 'tab:red'
-    ax1_2.set_ylabel('PSNR (dB)', color=color3, fontsize=12)
-    line3 = ax1_2.plot(scale_exponents, psnr_finite, '^-', color=color3, linewidth=2, markersize=6, linestyle='--', label='PSNR')
-    ax1_2.tick_params(axis='y', labelcolor=color3)
-    
-    # Add title and legend
-    plt.title(f'MXFP Scaling Test Summary - {elem_format.upper()}\nKey Metrics vs Scale Exponent', 
-              fontsize=14, fontweight='bold', pad=20)
-    
-    # Combine legends
-    lines = line1 + line2 + line3
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc='upper right', fontsize=10)
-    
-    plt.tight_layout()
-    
-    # Save summary plot
-    summary_path = output_path / f'mxfp_scaling_summary_{elem_format}.png'
-    plt.savefig(summary_path, dpi=300, bbox_inches='tight', facecolor='white')
-    plt.close()
-    
-    # This will be logged by the caller
-    pass
 
 def save_results_to_file(results, output_path):
     """Save detailed results to a text file."""
@@ -955,7 +968,7 @@ def save_results_to_file(results, output_path):
             scale_key = f'scale_{i}'
             if scale_key in results['metrics']:
                 metrics = results['metrics'][scale_key]['metrics']
-                overflow_underflow_analysis = results['metrics'][scale_key]['overflow_underflow_analysis']
+                mse_info = results['metrics'][scale_key].get('mse_info', {})
                 
                 f.write(f"Scale Exponent {scale_exp:.2f} (Factor: {2**scale_exp:.6f}):\n")
                 f.write("  Performance Metrics:\n")
@@ -967,27 +980,28 @@ def save_results_to_file(results, output_path):
                 f.write(f"    Max Absolute Error: {metrics['max_abs_error']:.6e}\n")
                 f.write(f"    Relative Error: {metrics['relative_error']:.2f}%\n")
                 
-                f.write("  Overflow/Underflow Analysis:\n")
-                f.write(f"    Total Elements: {overflow_underflow_analysis['total_elements']:,}\n")
-                f.write(f"    Underflow Count: {overflow_underflow_analysis['underflow_count']:,} ({overflow_underflow_analysis['underflow_percent']:.2f}%)\n")
-                f.write(f"    Flush to Zero Count: {overflow_underflow_analysis['flush_count']:,} ({overflow_underflow_analysis['flush_percent']:.2f}%)\n")
-                f.write(f"    Overflow Count: {overflow_underflow_analysis['overflow_count']:,} ({overflow_underflow_analysis['overflow_percent']:.2f}%)\n")
-                f.write(f"    Min Denormal: {overflow_underflow_analysis['min_denormal']:.2e}\n")
-                f.write(f"    Min Normal: {overflow_underflow_analysis['min_norm']:.2e}\n")
-                f.write(f"    Max Normal: {overflow_underflow_analysis['max_norm']:.2e}\n")
-                f.write(f"    Tensor Range: [{overflow_underflow_analysis['tensor_range'][0]:.2e}, {overflow_underflow_analysis['tensor_range'][1]:.2e}]\n")
-                f.write(f"    Severity: {overflow_underflow_analysis['severity'].upper()}\n")
-                f.write(f"    Has Significant Underflow: {'Yes' if overflow_underflow_analysis['has_significant_underflow'] else 'No'}\n")
-                f.write(f"    Has Significant Overflow: {'Yes' if overflow_underflow_analysis['has_significant_overflow'] else 'No'}\n")
-                if overflow_underflow_analysis['error']:
-                    f.write(f"    Analysis Error: {overflow_underflow_analysis['error']}\n")
+                if mse_info:
+                    f.write("  MSE Analysis by Minus Level:\n")
+                    f.write(f"    MSE (minus_level=0): {mse_info.get('mse_scale', 0):.6e}\n")
+                    if 'best_minus_level' in mse_info:
+                        f.write(f"    Best minus_level: {mse_info.get('best_minus_level', 0):.1f}\n")
+                    if 'tested_minus_levels' in mse_info and mse_info.get('tested_minus_levels'):
+                        f.write(f"    Tested minus_levels: {mse_info.get('tested_minus_levels')}\n")
+                    if 'mse_by_minus_level' in mse_info and mse_info.get('mse_by_minus_level'):
+                        f.write("    MSE by minus_level:\n")
+                        for ml, mse_val in sorted(mse_info.get('mse_by_minus_level', {}).items()):
+                            f.write(f"      minus_level={ml}: {mse_val:.6e}\n")
+                        # Calculate and show best MSE
+                        all_mse = [mse_info.get('mse_scale', 0)] + list(mse_info.get('mse_by_minus_level', {}).values())
+                        best_mse = min(all_mse)
+                        f.write(f"    Best MSE: {best_mse:.6e}\n")
                 f.write("\n")
     
     # This will be logged by the caller
     pass
 
 def remove_scaling(A,elem_format):
-    from fake_quant_ops.utils.saver.mxfp_saver import _remove_scaling_mx
+    from utils.saver.mxfp_saver import _remove_scaling_mx
     return _remove_scaling_mx(A=A,
                 scale_bits=8,
                 elem_format=elem_format,
@@ -1072,34 +1086,35 @@ def process_single_tensor(input_path, args, logger=None):
     save_results_to_file(results, output_dir)
     tensor_logger.info(f"Detailed results saved to: {output_dir}")
     
-    # Generate plots unless disabled
+    # Generate MSE by minus_level plot unless disabled
     if not args.no_plots:
-        plot_scaling_results(results, output_dir)
-        tensor_logger.info(f"Plots saved to: {output_dir}")
-    
-    # Perform detailed analysis
-    analysis_results = analyze_scaling_results(results, tensor_logger)
-    
-    # Analyze overflow/underflow results
-    analyze_overflow_underflow_results(results, tensor_logger)
+        plot_mse_by_minus_level(results, output_dir)
+        tensor_logger.info(f"Plot saved to: {output_dir}")
     
     # Print summary
     tensor_logger.info("\n" + "=" * 60)
     tensor_logger.info("SCALING TEST SUMMARY")
     tensor_logger.info("=" * 60)
     
-    # Use analysis results for summary
-    best_composite = analysis_results['best_composite']
-    best_mse = analysis_results['best_mse']
-    best_cosine = analysis_results['best_cosine']
-    
-    tensor_logger.info(f"Best Cosine Similarity: {best_cosine['metrics']['cosine_similarity']:.6f} at scale {best_cosine['scale_exp']:.2f}")
-    tensor_logger.info(f"Best MSE: {best_mse['metrics']['mse']:.6e} at scale {best_mse['scale_exp']:.2f}")
-    tensor_logger.info(f"Best PSNR: {best_mse['metrics']['psnr']:.2f} dB at scale {best_mse['scale_exp']:.2f}")
-    
-    tensor_logger.info(f"\n🎯 RECOMMENDED Scaling Factor: {best_composite['scale_factor']:.6f}")
-    tensor_logger.info(f"   Scale Exponent: {best_composite['scale_exp']:.2f}")
-    tensor_logger.info(f"   Composite Score: {best_composite['composite_score']:.4f}")
+    # Get results for summary
+    scale_key = 'scale_0'
+    if scale_key in results['metrics']:
+        metrics = results['metrics'][scale_key]['metrics']
+        mse_info = results['metrics'][scale_key].get('mse_info', {})
+        scale_exp = results['metrics'][scale_key].get('scale_exponent', 0)
+        
+        tensor_logger.info(f"Scale Exponent: {scale_exp:.2f}")
+        tensor_logger.info(f"Final MSE: {metrics['mse']:.6e}")
+        tensor_logger.info(f"Cosine Similarity: {metrics['cosine_similarity']:.6f}")
+        tensor_logger.info(f"PSNR: {metrics['psnr']:.2f} dB")
+        
+        if 'best_minus_level' in mse_info:
+            tensor_logger.info(f"\n🎯 RECOMMENDED minus_level: {mse_info['best_minus_level']:.1f}")
+        
+        if 'mse_by_minus_level' in mse_info and mse_info['mse_by_minus_level']:
+            all_mse = [mse_info.get('mse_scale', 0)] + list(mse_info['mse_by_minus_level'].values())
+            best_mse = min(all_mse)
+            tensor_logger.info(f"Best MSE: {best_mse:.6e}")
     
     tensor_logger.info(f"\nResults saved to: {output_dir}")
     tensor_logger.info("Test completed successfully!")
@@ -1111,13 +1126,372 @@ def process_single_tensor(input_path, args, logger=None):
     
     return 0
 
+def process_folder(input_folder, args):
+    """
+    Process all tensor files in a folder and generate aggregated statistics.
+    
+    Args:
+        input_folder (Path): Path to folder containing tensor files
+        args: Command line arguments
+        
+    Returns:
+        int: 0 if successful, 1 otherwise
+    """
+    input_folder = Path(input_folder)
+    
+    if not input_folder.exists():
+        print(f"Error: Input folder does not exist: {input_folder}")
+        return 1
+    
+    if not input_folder.is_dir():
+        print(f"Error: Input path is not a directory: {input_folder}")
+        return 1
+    
+    # Find all .pt files in the folder
+    tensor_files = list(input_folder.glob("*.pt"))
+    if not tensor_files:
+        print(f"Error: No .pt files found in folder: {input_folder}")
+        return 1
+    
+    print(f"Found {len(tensor_files)} tensor file(s) in folder: {input_folder}")
+    print("=" * 80)
+    
+    # Setup aggregated output directory
+    folder_name = input_folder.name
+    if args.output_dir is None:
+        output_dir = Path(f"./draw/scaling_analysis/{args.elem_format}/{folder_name}_aggregated")
+    else:
+        output_dir = Path(args.output_dir) / "aggregated"
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Setup logging
+    folder_logger = setup_logging(output_dir, folder_name, args.elem_format)
+    folder_logger.info(f"Processing folder: {input_folder}")
+    folder_logger.info(f"Found {len(tensor_files)} tensor files")
+    folder_logger.info("=" * 60)
+    
+    # Collect all MSE results
+    all_mse_results = []  # List of {minus_level: mse} dicts
+    successful_count = 0
+    
+    for i, tensor_file in enumerate(tensor_files, 1):
+        folder_logger.info(f"\n[{i}/{len(tensor_files)}] Processing: {tensor_file.name}")
+        
+        try:
+            # Load tensor
+            input_tensor = torch.load(str(tensor_file), map_location='cpu', weights_only=False)
+            
+            # Handle case where loaded object is not a tensor
+            if not isinstance(input_tensor, torch.Tensor):
+                if isinstance(input_tensor, dict) and 'tensor' in input_tensor:
+                    input_tensor = input_tensor['tensor']
+                elif isinstance(input_tensor, (list, tuple)) and len(input_tensor) > 0:
+                    input_tensor = input_tensor[0]
+                else:
+                    folder_logger.warning(f"Skipping {tensor_file.name}: Not a tensor")
+                    continue
+            
+            # Convert to BF16 if needed
+            if input_tensor.dtype != torch.bfloat16:
+                input_tensor = input_tensor.bfloat16()
+            
+            # Get format parameters
+            from quant.ops.mxfp import _get_format_params
+            ebits, mbits, emax, max_norm, min_norm = _get_format_params(args.elem_format)
+            
+            # Calculate scale_exp (same as test_scaling_levels)
+            tensor_abs_max = torch.max(torch.abs(input_tensor)).item()
+            tensor_shared_exp = np.floor(np.log2(tensor_abs_max)) if tensor_abs_max > 0 else 0
+            scale_exp = tensor_shared_exp - emax
+            
+            # Test minus_level combinations
+            axes = getattr(args, 'axes', -1)
+            block_size = getattr(args, 'block_size', 32)
+            quantized_tensor, mse_info = quantize_with_fixed_scale(
+                input_tensor, args.elem_format, args.scale_bits, scale_exp,
+                ebits, mbits, max_norm, axes=axes, block_size=block_size
+            )
+            
+            # Collect MSE data
+            mse_data = {}
+            mse_data[0] = mse_info.get('mse_scale', 0)
+            if 'mse_by_minus_level' in mse_info:
+                for minus_level, mse in mse_info['mse_by_minus_level'].items():
+                    mse_data[minus_level] = mse
+            
+            all_mse_results.append(mse_data)
+            successful_count += 1
+            
+            folder_logger.info(f"  ✅ Processed: {tensor_file.name}")
+            if 'best_minus_level' in mse_info:
+                folder_logger.info(f"     Best minus_level: {mse_info['best_minus_level']:.1f}")
+            
+        except Exception as e:
+            folder_logger.error(f"  ❌ Error processing {tensor_file.name}: {str(e)}")
+            continue
+    
+    if not all_mse_results:
+        folder_logger.error("No successful tensor processing. Cannot generate aggregated plot.")
+        return 1
+    
+    # Calculate aggregated statistics
+    folder_logger.info("\n" + "=" * 60)
+    folder_logger.info("AGGREGATING RESULTS")
+    folder_logger.info("=" * 60)
+    folder_logger.info(f"Successfully processed: {successful_count}/{len(tensor_files)} tensors")
+    
+    # Get all minus_levels that appear in any result
+    all_minus_levels = set()
+    for mse_data in all_mse_results:
+        all_minus_levels.update(mse_data.keys())
+    all_minus_levels = sorted(all_minus_levels)
+    
+    # Calculate average MSE for each minus_level
+    avg_mse_by_minus_level = {}
+    std_mse_by_minus_level = {}
+    
+    for ml in all_minus_levels:
+        mse_values = []
+        for mse_data in all_mse_results:
+            if ml in mse_data:
+                mse_values.append(mse_data[ml])
+        
+        if mse_values:
+            avg_mse_by_minus_level[ml] = np.mean(mse_values)
+            std_mse_by_minus_level[ml] = np.std(mse_values)
+    
+    # Create aggregated results structure
+    aggregated_results = {
+        'elem_format': args.elem_format,
+        'scale_bits': args.scale_bits,
+        'format_params': {
+            'ebits': ebits,
+            'mbits': mbits,
+            'emax': emax,
+            'max_norm': max_norm,
+            'min_norm': min_norm
+        },
+        'metrics': {
+            'scale_0': {
+                'scale_exponent': 0.0,  # Placeholder
+                'mse_info': {
+                    'mse_scale': avg_mse_by_minus_level.get(0, 0),
+                    'mse_by_minus_level': {k: v for k, v in avg_mse_by_minus_level.items() if k != 0},
+                    'best_minus_level': float(min(avg_mse_by_minus_level, key=avg_mse_by_minus_level.get)) if avg_mse_by_minus_level else 0.0,
+                    'tested_minus_levels': all_minus_levels,
+                    'mse_std_by_minus_level': std_mse_by_minus_level
+                }
+            }
+        },
+        'scale_exponents': [0.0],
+        'num_tensors': successful_count
+    }
+    
+    # Generate aggregated plot
+    if not args.no_plots:
+        plot_aggregated_mse_by_minus_level(aggregated_results, output_dir, all_mse_results)
+        folder_logger.info(f"Aggregated plot saved to: {output_dir}")
+    
+    folder_logger.info("\n" + "=" * 60)
+    folder_logger.info("AGGREGATED SUMMARY")
+    folder_logger.info("=" * 60)
+    folder_logger.info(f"Number of tensors: {successful_count}")
+    
+    if avg_mse_by_minus_level:
+        best_ml = min(avg_mse_by_minus_level, key=avg_mse_by_minus_level.get)
+        best_mse = avg_mse_by_minus_level[best_ml]
+        folder_logger.info(f"Best minus_level (average): {best_ml:.1f}")
+        folder_logger.info(f"Average MSE at best minus_level: {best_mse:.6e}")
+        
+        folder_logger.info("\nAverage MSE by minus_level:")
+        for ml in sorted(avg_mse_by_minus_level.keys()):
+            avg_mse = avg_mse_by_minus_level[ml]
+            std_mse = std_mse_by_minus_level.get(ml, 0)
+            folder_logger.info(f"  minus_level={ml}: {avg_mse:.6e} ± {std_mse:.6e}")
+    
+    folder_logger.info("=" * 60)
+    
+    return 0
+
+def plot_aggregated_mse_by_minus_level(aggregated_results, output_path, all_mse_results):
+    """
+    Plot aggregated MSE curve with average and standard deviation.
+    
+    Args:
+        aggregated_results (dict): Aggregated results structure
+        output_path (Path): Output directory for plots
+        all_mse_results (list): List of individual MSE results for error bars
+    """
+    elem_format = aggregated_results['elem_format']
+    
+    # Get aggregated MSE data
+    scale_key = 'scale_0'
+    if scale_key not in aggregated_results['metrics']:
+        return
+    
+    mse_info = aggregated_results['metrics'][scale_key].get('mse_info', {})
+    if 'mse_by_minus_level' not in mse_info or not mse_info['mse_by_minus_level']:
+        return
+    
+    # Collect MSE data
+    minus_level_mse = {}
+    minus_level_std = {}
+    
+    # Add base case (minus_level=0)
+    minus_level_mse[0] = mse_info.get('mse_scale', 0)
+    std_data = mse_info.get('mse_std_by_minus_level', {})
+    minus_level_std[0] = std_data.get(0, 0)
+    
+    # Add other minus_levels
+    for minus_level, mse in mse_info['mse_by_minus_level'].items():
+        minus_level_mse[minus_level] = mse
+        minus_level_std[minus_level] = std_data.get(minus_level, 0)
+    
+    if not minus_level_mse:
+        return
+    
+    # Get format info
+    format_params = aggregated_results.get('format_params', {})
+    num_tensors = aggregated_results.get('num_tensors', 0)
+    
+    # Sort minus_levels
+    minus_levels = sorted(minus_level_mse.keys())
+    mse_values = [minus_level_mse[ml] for ml in minus_levels]
+    std_values = [minus_level_std.get(ml, 0) for ml in minus_levels]
+    
+    # Find best minus_level
+    best_idx = np.argmin(mse_values)
+    best_ml = minus_levels[best_idx]
+    best_mse = mse_values[best_idx]
+    
+    # Create beautiful plot with modern style
+    try:
+        plt.style.use('seaborn-v0_8-darkgrid')
+    except:
+        try:
+            plt.style.use('seaborn-darkgrid')
+        except:
+            plt.style.use('default')
+    
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Use a beautiful gradient color scheme
+    colors = plt.cm.plasma(np.linspace(0.2, 0.8, len(minus_levels)))
+    
+    # Plot main MSE curve with error bars
+    # First plot the line without markers
+    ax.errorbar(minus_levels, mse_values, yerr=std_values, 
+               fmt='-', linewidth=3.5, 
+               color='#4A90E2', alpha=0.8, zorder=2, 
+               capsize=5, capthick=2, elinewidth=2,
+               label='Average MSE', ecolor='#4A90E2')
+    
+    # Plot points with gradient colors and white edges
+    for i, (ml, mse) in enumerate(zip(minus_levels, mse_values)):
+        marker_size = 14 if ml == best_ml else 11
+        ax.plot(ml, mse, 'o', markersize=marker_size, color=colors[i], 
+               markeredgecolor='white', markeredgewidth=2.5, zorder=4)
+    
+    # Highlight the best point with a prominent star
+    ax.plot(best_ml, best_mse, '*', markersize=30, color='#FF6B6B', 
+           markeredgecolor='white', markeredgewidth=3, 
+           label=f'Best: minus_level={best_ml}', zorder=6)
+    
+    # Add value annotations
+    # Annotate best point prominently
+    ax.annotate(f'MSE={best_mse:.2e}', 
+               xy=(best_ml, best_mse), 
+               xytext=(15, 20), 
+               textcoords='offset points',
+               fontsize=11, 
+               fontweight='bold',
+               bbox=dict(boxstyle='round,pad=0.6', facecolor='#FF6B6B', alpha=0.9, 
+                        edgecolor='white', linewidth=2),
+               arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.2', 
+                             color='#FF6B6B', lw=2.5),
+               color='white', zorder=7)
+    
+    # Annotate first and last points
+    if len(minus_levels) > 2:
+        if minus_levels[0] != best_ml:
+            ax.annotate(f'{mse_values[0]:.2e}', 
+                       xy=(minus_levels[0], mse_values[0]), 
+                       xytext=(0, -25), 
+                       textcoords='offset points',
+                       fontsize=9,
+                       ha='center',
+                       bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
+                               alpha=0.9, edgecolor='#4A90E2', linewidth=1.5),
+                       color='#2C3E50', fontweight='bold')
+        
+        if minus_levels[-1] != best_ml:
+            ax.annotate(f'{mse_values[-1]:.2e}', 
+                       xy=(minus_levels[-1], mse_values[-1]), 
+                       xytext=(0, -25), 
+                       textcoords='offset points',
+                       fontsize=9,
+                       ha='center',
+                       bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
+                               alpha=0.9, edgecolor='#4A90E2', linewidth=1.5),
+                       color='#2C3E50', fontweight='bold')
+    
+    # Styling
+    ax.set_xlabel('Minus Level', fontsize=14, fontweight='bold', color='#333333')
+    ax.set_ylabel('MSE (log scale)', fontsize=14, fontweight='bold', color='#333333')
+    
+    # Enhanced title
+    title = f'Average MSE vs Minus Level Analysis - {elem_format.upper()}'
+    # if format_params:
+    #     title += f'\nFormat: E{format_params.get("ebits", 0)}M{format_params.get("mbits", 0)} | {num_tensors} tensors averaged'
+    ax.set_title(title, fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
+    
+    # Enhanced grid
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.7, color='#CCCCCC', zorder=1)
+    ax.set_axisbelow(True)
+    
+    # Set x-axis to show integer ticks
+    ax.set_xticks(minus_levels)
+    ax.set_xticklabels([f'{ml}' for ml in minus_levels], fontsize=12, fontweight='bold')
+    ax.tick_params(axis='x', length=6, width=1.5, colors='#333333')
+    
+    # Format y-axis
+    ax.tick_params(axis='y', labelsize=11, colors='#333333')
+    ax.tick_params(axis='y', length=6, width=1.5)
+    
+    # Use log scale for y-axis
+    ax.set_yscale('log')
+    
+    # Add legend
+    legend = ax.legend(loc='upper right', fontsize=12, framealpha=0.95, 
+                      fancybox=True, shadow=True, edgecolor='#CCCCCC', 
+                      facecolor='white', frameon=True)
+    legend.get_frame().set_linewidth(1.5)
+    
+    # Add background color
+    ax.set_facecolor('#F8F9FA')
+    fig.patch.set_facecolor('white')
+    
+    # Add subtle border
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#E0E0E0')
+        spine.set_linewidth(1.5)
+    
+    plt.tight_layout()
+    
+    # Save plot
+    plot_path = output_path / f'mxfp_mse_by_minus_level_aggregated_{elem_format}.png'
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.close()
+
 def main():
     """Main function for MXFP scaling test."""
     parser = argparse.ArgumentParser(description='Test different scaling strategies for MXFP quantization')
-    parser.add_argument('input_tensors', nargs='+', help='Path(s) to input BF16 tensor file(s) (.pt)')
+    parser.add_argument('input_paths', nargs='+', 
+                        help='Path(s) to input BF16 tensor file(s) (.pt) or folder(s) containing .pt files')
     parser.add_argument('--output-dir', default=None, 
                         help='Output directory for results (default: ./draw/scaling_analysis/{args.elem_format}/{tensor_name}/)')
-    parser.add_argument('--elem-format', default='fp8_e4m3', 
+    parser.add_argument('--elem-format', default='fp4_e2m1', 
                         choices=['fp8_e4m3', 'fp8_e5m2', 'fp4_e2m1', 'fp6_e3m2', 'fp6_e2m3'],
                         help='Element format for quantization (default: fp8_e4m3)')
     parser.add_argument('--scale-bits', type=int, default=8,
@@ -1135,35 +1509,51 @@ def main():
     
     args = parser.parse_args()
     
-    # Process multiple tensors
-    total_tensors = len(args.input_tensors)
+    # Process each input path (file or folder)
+    total_paths = len(args.input_paths)
     successful_tests = 0
     
-    print(f"Processing {total_tensors} tensor(s)...")
+    print(f"Processing {total_paths} path(s)...")
     print("=" * 80)
     
-    for i, tensor_path in enumerate(args.input_tensors, 1):
-        print(f"\n[{i}/{total_tensors}] Processing: {tensor_path}")
+    for i, input_path_str in enumerate(args.input_paths, 1):
+        print(f"\n[{i}/{total_paths}] Processing: {input_path_str}")
         print("-" * 60)
         
-        input_path = Path(tensor_path)
-        result = process_single_tensor(input_path, args)
+        input_path = Path(input_path_str)
         
-        if result == 0:
-            successful_tests += 1
-            print(f"✅ Successfully processed: {tensor_path}")
+        if not input_path.exists():
+            print(f"❌ Path does not exist: {input_path_str}")
+            continue
+        
+        if input_path.is_dir():
+            # Process folder
+            result = process_folder(input_path, args)
+            if result == 0:
+                successful_tests += 1
+                print(f"✅ Successfully processed folder: {input_path_str}")
+            else:
+                print(f"❌ Failed to process folder: {input_path_str}")
+        elif input_path.is_file():
+            # Process single file
+            result = process_single_tensor(input_path, args)
+            if result == 0:
+                successful_tests += 1
+                print(f"✅ Successfully processed: {input_path_str}")
+            else:
+                print(f"❌ Failed to process: {input_path_str}")
         else:
-            print(f"❌ Failed to process: {tensor_path}")
+            print(f"❌ Invalid path (neither file nor directory): {input_path_str}")
     
     # Final summary
     print("\n" + "=" * 80)
     print("FINAL SUMMARY")
     print("=" * 80)
-    print(f"Total tensors: {total_tensors}")
+    print(f"Total paths: {total_paths}")
     print(f"Successful: {successful_tests}")
-    print(f"Failed: {total_tensors - successful_tests}")
+    print(f"Failed: {total_paths - successful_tests}")
     
-    if successful_tests == total_tensors:
+    if successful_tests == total_paths:
         print("🎉 All tests completed successfully!")
         return 0
     else:
