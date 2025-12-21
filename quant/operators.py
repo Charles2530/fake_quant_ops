@@ -107,14 +107,14 @@ def quant_dequant_tensor_with_backward(tensor, forward_format='mxfp8_e4m3',
         tensor, forward_format, minus_exp, backward_quantize, backward_format
     )
 
-def quant_dequant_qkv(q,k,v,forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3'):
+def quant_dequant_qkv(q,k,v,minus_exp=None, forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3'):
     """
     Quantize and dequantize Q, K, V tensors with backward quantization support.
     Returns tensors converted to bfloat16, matching the original implementation.
     """
-    q = quant_dequant_tensor_with_backward(q, forward_format, None, backward_quantize, backward_format)
-    k = quant_dequant_tensor_with_backward(k, forward_format, None, backward_quantize, backward_format)
-    v = quant_dequant_tensor_with_backward(v, forward_format, None, backward_quantize, backward_format)
+    q = quant_dequant_tensor_with_backward(q, forward_format, minus_exp, backward_quantize, backward_format)
+    k = quant_dequant_tensor_with_backward(k, forward_format, minus_exp, backward_quantize, backward_format)
+    v = quant_dequant_tensor_with_backward(v, forward_format, minus_exp, backward_quantize, backward_format)
     # Convert to bfloat16 to match original implementation behavior
     q = q.to(torch.bfloat16)
     k = k.to(torch.bfloat16)
