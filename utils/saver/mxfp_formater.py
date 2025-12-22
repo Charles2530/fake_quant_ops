@@ -614,7 +614,7 @@ class MXFPMatMul(Function):
         # 自动保存forward阶段的tensor
         if layer_type is not None:
             try:
-                from utils.saver.tensor_saver import save_tensor
+                from megatron.core.tensor_saver import save_tensor
                 
                 # 根据component类型确定tensor名称
                 if component == "FA" or component == "attention":
@@ -717,7 +717,7 @@ class MXFPMatMul(Function):
         # 自动保存backward阶段的tensor
         if ctx.layer_type is not None:
             try:
-                from utils.saver.tensor_saver import save_tensor
+                from megatron.core.tensor_saver import save_tensor
                 
                 # 保存梯度输出
                 save_tensor(
@@ -808,7 +808,7 @@ class MXFPBAddBmm(Function):
         # 自动保存forward阶段的tensor
         if layer_type is not None:
             try:
-                from utils.saver.tensor_saver import save_tensor
+                from megatron.core.tensor_saver import save_tensor
                 
                 # 根据component类型确定tensor名称
                 if component == "FA" or component == "attention":
@@ -901,7 +901,7 @@ class MXFPBAddBmm(Function):
         # 自动保存backward阶段的tensor
         if ctx.layer_type is not None:
             try:
-                from utils.saver.tensor_saver import save_tensor
+                from megatron.core.tensor_saver import save_tensor
                 
                 # 保存梯度输出
                 save_tensor(
@@ -1105,362 +1105,32 @@ def _remove_scaling_mx(
     A = A / (2**shared_exp)
     return A
 
-def analyze_quantized_value_distribution(quantized_tensor, target_values, tolerance=1e-6):
-    """
-    Analyze the distribution of quantized values in specific ranges.
-    
-    Args:
-        quantized_tensor (torch.Tensor): Quantized tensor after _quantize_elemwise_core
-        target_values (list): List of target values to count (e.g., [0, 0.5, 1, 1.5, 2, 3, 4, 6])
-        tolerance (float): Tolerance for matching values
-        
-    Returns:
-        dict: Dictionary with counts and percentages for each value (including negative)
-    """
-    # Convert to numpy for analysis
-    # Convert to float32 first to handle BFloat16 and other types
-    if quantized_tensor.dtype == torch.bfloat16:
-        quantized_tensor = quantized_tensor.float()
-    
-    if quantized_tensor.is_cuda:
-        values = quantized_tensor.cpu().numpy().flatten()
-    else:
-        values = quantized_tensor.numpy().flatten()
-    
-    total_elements = len(values)
-    if total_elements == 0:
-        return {}
-    
-    # Count distribution
-    distribution = {}
-    
-    for target_val in target_values:
-        # Count positive values
-        pos_mask = np.abs(values - target_val) < tolerance
-        pos_count = np.sum(pos_mask)
-        pos_percent = (pos_count / total_elements) * 100
-        
-        # Count negative values
-        neg_mask = np.abs(values + target_val) < tolerance
-        neg_count = np.sum(neg_mask)
-        neg_percent = (neg_count / total_elements) * 100
-        
-        # Count zero (only for target_val == 0)
-        if target_val == 0:
-            zero_mask = np.abs(values) < tolerance
-            zero_count = np.sum(zero_mask)
-            zero_percent = (zero_count / total_elements) * 100
-            distribution[0.0] = {
-                'count': int(zero_count),
-                'percent': float(zero_percent)
-            }
-        else:
-            distribution[target_val] = {
-                'count': int(pos_count),
-                'percent': float(pos_percent)
-            }
-            distribution[-target_val] = {
-                'count': int(neg_count),
-                'percent': float(neg_percent)
-            }
-    
-    return distribution
-
-
-def _quantize_mx_with_statistics(
-    A,
-    scale_bits,
-    elem_format,
-    shared_exp_method="max",
-    axes=None,
-    block_size=0,
-    round="nearest",
-    flush_fp32_subnorms=False,
-    scaling_control="max",
-    target_values=None
-):
-    """
-    Quantize tensor and return both quantized tensor and value distribution statistics.
-    This is a wrapper around _quantize_mx that captures the quantized values after _quantize_elemwise_core.
-    
-    Args:
-        A: Input tensor
-        scale_bits, elem_format, etc.: Same as _quantize_mx
-        target_values: List of target values to analyze (e.g., [0, 0.5, 1, 1.5, 2, 3, 4, 6])
-        
-    Returns:
-        tuple: (quantized_tensor, distribution_stats)
-    """
-    if elem_format == None:
-        return A, {}
-    
-    assert(scale_bits > 0)
-    
-    if axes is None:
-        axes = []
-    else:
-        axes = [axes] if type(axes) == int else axes
-        axes = [x + A.ndim if x < 0 else x for x in axes]
-    
-    ebits, mbits, emax, max_norm, _ = _get_format_params(elem_format)
-    
-    if block_size > 0:
-        A, axes, orig_shape, padded_shape = _reshape_to_blocks(A, axes, block_size)
-    
-    shared_exp_axes = [x + 1 for x in axes] if block_size > 0 else axes
-    
-    shared_exp = _shared_exponents(
-        A, method=shared_exp_method, axes=shared_exp_axes, ebits=0, scaling_control=scaling_control,
-    )
-    
-    if flush_fp32_subnorms:
-        A = A * (shared_exp > -FP32_EXPONENT_BIAS).type(A.dtype)
-    
-    shared_exp = shared_exp - emax
-    
-    scale_emax = 2**(scale_bits-1) - 1
-    shared_exp[shared_exp > scale_emax] = float("NaN")
-    shared_exp[shared_exp < -scale_emax] = -scale_emax
-    
-    A = A / (2**shared_exp)
-    
-    # Quantize - this is where we want to capture the distribution
-    A_quantized = _quantize_elemwise_core(
-        A, mbits, ebits, max_norm, round=round,
-        allow_denorm=True, saturate_normals=True
-    )
-    
-    # Analyze distribution if target_values provided
-    distribution_stats = {}
-    if target_values is not None:
-        distribution_stats = analyze_quantized_value_distribution(
-            A_quantized, target_values, tolerance=1e-5
-        )
-    
-    # Scale back
-    A_quantized = A_quantized * (2**shared_exp)
-    
-    if block_size:
-        A_quantized = _undo_reshape_to_blocks(A_quantized, padded_shape, orig_shape, axes)
-    
-    return A_quantized, distribution_stats
-
-
-def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1', 
-                                      target_values=[0, 0.5, 1, 1.5, 2, 3, 4, 6],
-                                      output_dir=None, scale_bits=8, block_size=32, axes=-1):
-    """
-    Analyze value distribution for all tensor files in a folder.
-    
-    Args:
-        folder_path (str): Path to folder containing .pt tensor files
-        elem_format (str): Element format (default: 'fp4_e2m1')
-        target_values (list): List of target values to analyze
-        output_dir (str): Output directory for plots (default: ./draw/value_distribution/)
-        scale_bits (int): Number of scale bits
-        block_size (int): Block size for tiling
-        axes (int): Axes for shared exponent calculation
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    from pathlib import Path
-    import os
-    
-    folder_path = Path(folder_path)
-    if not folder_path.exists() or not folder_path.is_dir():
-        raise ValueError(f"Folder does not exist: {folder_path}")
-    
-    # Find all .pt files
-    tensor_files = list(folder_path.glob("*.pt"))
-    if not tensor_files:
-        print(f"No .pt files found in {folder_path}")
-        return
-    
-    print(f"Found {len(tensor_files)} tensor files in {folder_path}")
-    
-    # Setup output directory
-    if output_dir is None:
-        output_dir = Path("./draw/value_distribution") / folder_path.name
-    else:
-        output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Collect statistics from all tensors
-    all_distributions = []
-    successful_count = 0
-    
-    for i, tensor_file in enumerate(tensor_files, 1):
-        print(f"[{i}/{len(tensor_files)}] Processing: {tensor_file.name}")
-        
-        try:
-            # Load tensor
-            data = torch.load(str(tensor_file), map_location='cpu', weights_only=False)
-            
-            if isinstance(data, dict) and 'tensor' in data:
-                input_tensor = data['tensor']
-            elif isinstance(data, torch.Tensor):
-                input_tensor = data
-            else:
-                print(f"  ⚠️  Skipping {tensor_file.name}: Invalid format")
-                continue
-            
-            # Convert to bfloat16 if needed
-            if input_tensor.dtype != torch.bfloat16:
-                input_tensor = input_tensor.bfloat16()
-            
-            # Quantize and get statistics
-            quantized_tensor, distribution = _quantize_mx_with_statistics(
-                input_tensor,
-                scale_bits=scale_bits,
-                elem_format=elem_format,
-                shared_exp_method="max",
-                axes=axes,
-                block_size=block_size,
-                round="nearest",
-                flush_fp32_subnorms=False,
-                scaling_control="max",
-                target_values=target_values
-            )
-            
-            if distribution:
-                all_distributions.append(distribution)
-                successful_count += 1
-                print(f"  ✅ Processed: {tensor_file.name}")
-            else:
-                print(f"  ⚠️  No distribution data for {tensor_file.name}")
-                
-        except Exception as e:
-            print(f"  ❌ Error processing {tensor_file.name}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            continue
-    
-    if not all_distributions:
-        print("No valid distribution data collected.")
-        return
-    
-    print(f"\nSuccessfully processed {successful_count}/{len(tensor_files)} tensors")
-    
-    # Aggregate statistics
-    aggregated_dist = {}
-    for dist in all_distributions:
-        for value, stats in dist.items():
-            if value not in aggregated_dist:
-                aggregated_dist[value] = {'count': 0, 'percent': []}
-            aggregated_dist[value]['count'] += stats['count']
-            aggregated_dist[value]['percent'].append(stats['percent'])
-    
-    # Calculate average percentages
-    for value in aggregated_dist:
-        aggregated_dist[value]['avg_percent'] = np.mean(aggregated_dist[value]['percent'])
-        aggregated_dist[value]['std_percent'] = np.std(aggregated_dist[value]['percent'])
-    
-    # Prepare data for plotting
-    sorted_values = sorted(aggregated_dist.keys())
-    percentages = [aggregated_dist[v]['avg_percent'] for v in sorted_values]
-    std_percentages = [aggregated_dist[v].get('std_percent', 0) for v in sorted_values]
-    labels = [f'{v:+.1f}' if v != 0 else '0' for v in sorted_values]
-    
-    # Create beautiful plot
-    try:
-        plt.style.use('seaborn-v0_8-darkgrid')
-    except:
-        try:
-            plt.style.use('seaborn-darkgrid')
-        except:
-            plt.style.use('default')
-    
-    fig, ax = plt.subplots(figsize=(14, 8))
-    
-    # Use gradient colors
-    colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(sorted_values)))
-    
-    # Create bar plot with error bars
-    bars = ax.bar(range(len(sorted_values)), percentages, 
-                  yerr=std_percentages,
-                  color=colors, alpha=0.8, edgecolor='white', linewidth=2,
-                  error_kw={'elinewidth': 2, 'ecolor': '#333333', 'capsize': 5})
-    
-    # Add value labels on bars
-    for i, (bar, pct, std) in enumerate(zip(bars, percentages, std_percentages)):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height + std + 0.5,
-                f'{pct:.2f}%',
-                ha='center', va='bottom', fontsize=10, fontweight='bold')
-    
-    # Styling
-    ax.set_xlabel('Quantized Values', fontsize=14, fontweight='bold', color='#333333')
-    ax.set_ylabel('Percentage (%)', fontsize=14, fontweight='bold', color='#333333')
-    ax.set_xticks(range(len(sorted_values)))
-    ax.set_xticklabels(labels, fontsize=12, fontweight='bold')
-    ax.set_title(f'Value Distribution Analysis - {elem_format.upper()}\n'
-                 f'{successful_count} tensors from {folder_path.name}',
-                 fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
-    
-    # Grid
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.7, color='#CCCCCC', axis='y')
-    ax.set_axisbelow(True)
-    
-    # Background
-    ax.set_facecolor('#F8F9FA')
-    fig.patch.set_facecolor('white')
-    
-    # Border
-    for spine in ax.spines.values():
-        spine.set_edgecolor('#E0E0E0')
-        spine.set_linewidth(1.5)
-    
-    plt.tight_layout()
-    
-    # Save plot
-    plot_path = output_dir / f'value_distribution_{elem_format}_{folder_path.name}.png'
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
-    plt.close()
-    
-    print(f"\n✅ Plot saved to: {plot_path}")
-    
-    # Print summary
-    print("\n" + "=" * 60)
-    print("VALUE DISTRIBUTION SUMMARY")
-    print("=" * 60)
-    for value in sorted_values:
-        stats = aggregated_dist[value]
-        print(f"Value {value:+.1f}: {stats['avg_percent']:.2f}% ± {stats.get('std_percent', 0):.2f}% "
-              f"(total count: {stats['count']:,})")
-    print("=" * 60)
-    
-    return aggregated_dist
-
-
 if __name__ == '__main__':
-    import argparse
+    A = torch.load("grad_output.pt", map_location='cpu').cuda()
+    print(f"A_shape:{A.shape},grad_max:{torch.max(A)},grad_min:{torch.min(A)}")
+    B = torch.load("total_input.pt", map_location='cpu').cuda()
+    print(f"B_shape:{B.shape},input_max:{torch.max(B)},input_min:{torch.min(B)}")
+    A = A.unsqueeze(0).repeat(3, 1, 1)
+    B = B.unsqueeze(0).repeat(3, 1, 1)
+    C = torch.matmul(A.transpose(-2, -1), B)
+    D = torch.baddbmm(C,A.transpose(-2,-1),B)
+    print(f"C_shape:{C.shape},output_max:{torch.max(C)},output_min:{torch.min(C)}")
+    C_e4m3 = mxfp_matmul(A.transpose(-2,-1),B,'fp8_e4m3')
+    D_e4m3 = mxfp_baddbmm(C,A.transpose(-2,-1),B,elem_format='fp8_e4m3')
+    print(f"C_shape:{C_e4m3.shape},output_max:{torch.max(C_e4m3)},output_min:{torch.min(C_e4m3)}")
+    print(f"D_shape:{D_e4m3.shape},output_max:{torch.max(D_e4m3)},output_min:{torch.min(D_e4m3)}")
+    print(torch.isnan(C).any())
+
+    mse_e4m3 = torch.mean((C - C_e4m3) ** 2)
+    max_err_e4m3 = torch.max(torch.abs(C - C_e4m3))
+    print(f"MSE: {mse_e4m3:.20f}")
+    print(f"Max Error: {max_err_e4m3:.20f}")
+    print(f"相对误差: {mse_e4m3 / torch.mean(C ** 2):.20f}")
     
-    parser = argparse.ArgumentParser(description='Analyze value distribution for fp4_e2m1 quantization')
-    parser.add_argument('folder_path', type=str, help='Path to folder containing .pt tensor files')
-    parser.add_argument('--elem-format', default='fp4_e2m1', 
-                        choices=['fp4_e2m1', 'fp8_e4m3', 'fp8_e5m2'],
-                        help='Element format (default: fp4_e2m1)')
-    parser.add_argument('--output-dir', type=str, default=None,
-                        help='Output directory for plots (default: ./draw/value_distribution/)')
-    parser.add_argument('--scale-bits', type=int, default=8,
-                        help='Number of scale bits (default: 8)')
-    parser.add_argument('--block-size', type=int, default=32,
-                        help='Block size for tiling (default: 32)')
-    parser.add_argument('--axes', type=int, default=-1,
-                        help='Axes for shared exponent calculation (default: -1)')
+    b_mse_e4m3 = torch.mean((D - D_e4m3) ** 2)
+    b_max_err_e4m3 = torch.max(torch.abs(D - D_e4m3))
+    print(f"B_MSE: {b_mse_e4m3:.20f}")
+    print(f"B Max Error: {b_max_err_e4m3:.20f}")
     
-    args = parser.parse_args()
-    
-    # Default target values for fp4_e2m1
-    target_values = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
-    
-    analyze_folder_value_distribution(
-        folder_path=args.folder_path,
-        elem_format=args.elem_format,
-        target_values=target_values,
-        output_dir=args.output_dir,
-        scale_bits=args.scale_bits,
-        block_size=args.block_size,
-        axes=args.axes
-    )
+
 
