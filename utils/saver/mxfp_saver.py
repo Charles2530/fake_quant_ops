@@ -614,7 +614,7 @@ class MXFPMatMul(Function):
         # 自动保存forward阶段的tensor
         if layer_type is not None:
             try:
-                from megatron.core.tensor_saver import save_tensor
+                from utils.saver.tensor_saver import save_tensor
                 
                 # 根据component类型确定tensor名称
                 if component == "FA" or component == "attention":
@@ -717,7 +717,7 @@ class MXFPMatMul(Function):
         # 自动保存backward阶段的tensor
         if ctx.layer_type is not None:
             try:
-                from megatron.core.tensor_saver import save_tensor
+                from utils.saver.tensor_saver import save_tensor
                 
                 # 保存梯度输出
                 save_tensor(
@@ -808,7 +808,7 @@ class MXFPBAddBmm(Function):
         # 自动保存forward阶段的tensor
         if layer_type is not None:
             try:
-                from megatron.core.tensor_saver import save_tensor
+                from utils.saver.tensor_saver import save_tensor
                 
                 # 根据component类型确定tensor名称
                 if component == "FA" or component == "attention":
@@ -901,7 +901,7 @@ class MXFPBAddBmm(Function):
         # 自动保存backward阶段的tensor
         if ctx.layer_type is not None:
             try:
-                from megatron.core.tensor_saver import save_tensor
+                from utils.saver.tensor_saver import save_tensor
                 
                 # 保存梯度输出
                 save_tensor(

@@ -247,7 +247,7 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
             )
         )
         if isinstance(minus_exp, str) and "auto" in minus_exp:
-            if minus_exp == "auto":
+            if minus_exp == "auto":     
                 minus_exp_result = calculate_minus_mse_exp(
                     A, scale_bits=8, elem_format=elem_format, 
                     shared_exp_method=method, axes=axes, block_size=32, 

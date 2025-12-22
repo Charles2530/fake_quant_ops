@@ -765,7 +765,7 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
             A, scale_bits=scale_bits, elem_format=elem_format,
             shared_exp_method="max", axes=axes, block_size=block_size,
             round="nearest", flush_fp32_subnorms=False,
-            minus_exp=minus_level, minus_level=None, heuristic_level=None
+            minus_exp="auto", minus_level=minus_level, heuristic_level=None
         )
         
         # Calculate MSE with original tensor
@@ -1126,369 +1126,10 @@ def process_single_tensor(input_path, args, logger=None):
     
     return 0
 
-def process_folder(input_folder, args):
-    """
-    Process all tensor files in a folder and generate aggregated statistics.
-    
-    Args:
-        input_folder (Path): Path to folder containing tensor files
-        args: Command line arguments
-        
-    Returns:
-        int: 0 if successful, 1 otherwise
-    """
-    input_folder = Path(input_folder)
-    
-    if not input_folder.exists():
-        print(f"Error: Input folder does not exist: {input_folder}")
-        return 1
-    
-    if not input_folder.is_dir():
-        print(f"Error: Input path is not a directory: {input_folder}")
-        return 1
-    
-    # Find all .pt files in the folder
-    tensor_files = list(input_folder.glob("*.pt"))
-    if not tensor_files:
-        print(f"Error: No .pt files found in folder: {input_folder}")
-        return 1
-    
-    print(f"Found {len(tensor_files)} tensor file(s) in folder: {input_folder}")
-    print("=" * 80)
-    
-    # Setup aggregated output directory
-    folder_name = input_folder.name
-    if args.output_dir is None:
-        output_dir = Path(f"./draw/scaling_analysis/{args.elem_format}/{folder_name}_aggregated")
-    else:
-        output_dir = Path(args.output_dir) / "aggregated"
-    
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Setup logging
-    folder_logger = setup_logging(output_dir, folder_name, args.elem_format)
-    folder_logger.info(f"Processing folder: {input_folder}")
-    folder_logger.info(f"Found {len(tensor_files)} tensor files")
-    folder_logger.info("=" * 60)
-    
-    # Collect all MSE results
-    all_mse_results = []  # List of {minus_level: mse} dicts
-    successful_count = 0
-    
-    for i, tensor_file in enumerate(tensor_files, 1):
-        folder_logger.info(f"\n[{i}/{len(tensor_files)}] Processing: {tensor_file.name}")
-        
-        try:
-            # Load tensor
-            input_tensor = torch.load(str(tensor_file), map_location='cpu', weights_only=False)
-            
-            # Handle case where loaded object is not a tensor
-            if not isinstance(input_tensor, torch.Tensor):
-                if isinstance(input_tensor, dict) and 'tensor' in input_tensor:
-                    input_tensor = input_tensor['tensor']
-                elif isinstance(input_tensor, (list, tuple)) and len(input_tensor) > 0:
-                    input_tensor = input_tensor[0]
-                else:
-                    folder_logger.warning(f"Skipping {tensor_file.name}: Not a tensor")
-                    continue
-            
-            # Convert to BF16 if needed
-            if input_tensor.dtype != torch.bfloat16:
-                input_tensor = input_tensor.bfloat16()
-            
-            # Get format parameters
-            from quant.ops.mxfp import _get_format_params
-            ebits, mbits, emax, max_norm, min_norm = _get_format_params(args.elem_format)
-            
-            # Calculate scale_exp (same as test_scaling_levels)
-            tensor_abs_max = torch.max(torch.abs(input_tensor)).item()
-            tensor_shared_exp = np.floor(np.log2(tensor_abs_max)) if tensor_abs_max > 0 else 0
-            scale_exp = tensor_shared_exp - emax
-            
-            # Test minus_level combinations
-            axes = getattr(args, 'axes', -1)
-            block_size = getattr(args, 'block_size', 32)
-            quantized_tensor, mse_info = quantize_with_fixed_scale(
-                input_tensor, args.elem_format, args.scale_bits, scale_exp,
-                ebits, mbits, max_norm, axes=axes, block_size=block_size
-            )
-            
-            # Collect MSE data
-            mse_data = {}
-            mse_data[0] = mse_info.get('mse_scale', 0)
-            if 'mse_by_minus_level' in mse_info:
-                for minus_level, mse in mse_info['mse_by_minus_level'].items():
-                    mse_data[minus_level] = mse
-            
-            all_mse_results.append(mse_data)
-            successful_count += 1
-            
-            folder_logger.info(f"  ✅ Processed: {tensor_file.name}")
-            if 'best_minus_level' in mse_info:
-                folder_logger.info(f"     Best minus_level: {mse_info['best_minus_level']:.1f}")
-            
-        except Exception as e:
-            folder_logger.error(f"  ❌ Error processing {tensor_file.name}: {str(e)}")
-            continue
-    
-    if not all_mse_results:
-        folder_logger.error("No successful tensor processing. Cannot generate aggregated plot.")
-        return 1
-    
-    # Calculate aggregated statistics
-    folder_logger.info("\n" + "=" * 60)
-    folder_logger.info("AGGREGATING RESULTS")
-    folder_logger.info("=" * 60)
-    folder_logger.info(f"Successfully processed: {successful_count}/{len(tensor_files)} tensors")
-    
-    # Get all minus_levels that appear in any result
-    all_minus_levels = set()
-    for mse_data in all_mse_results:
-        all_minus_levels.update(mse_data.keys())
-    all_minus_levels = sorted(all_minus_levels)
-    
-    # Calculate average MSE for each minus_level
-    avg_mse_by_minus_level = {}
-    std_mse_by_minus_level = {}
-    
-    for ml in all_minus_levels:
-        mse_values = []
-        for mse_data in all_mse_results:
-            if ml in mse_data:
-                mse_values.append(mse_data[ml])
-        
-        if mse_values:
-            avg_mse_by_minus_level[ml] = np.mean(mse_values)
-            std_mse_by_minus_level[ml] = np.std(mse_values)
-    
-    # Create aggregated results structure
-    aggregated_results = {
-        'elem_format': args.elem_format,
-        'scale_bits': args.scale_bits,
-        'format_params': {
-            'ebits': ebits,
-            'mbits': mbits,
-            'emax': emax,
-            'max_norm': max_norm,
-            'min_norm': min_norm
-        },
-        'metrics': {
-            'scale_0': {
-                'scale_exponent': 0.0,  # Placeholder
-                'mse_info': {
-                    'mse_scale': avg_mse_by_minus_level.get(0, 0),
-                    'mse_by_minus_level': {k: v for k, v in avg_mse_by_minus_level.items() if k != 0},
-                    'best_minus_level': float(min(avg_mse_by_minus_level, key=avg_mse_by_minus_level.get)) if avg_mse_by_minus_level else 0.0,
-                    'tested_minus_levels': all_minus_levels,
-                    'mse_std_by_minus_level': std_mse_by_minus_level
-                }
-            }
-        },
-        'scale_exponents': [0.0],
-        'num_tensors': successful_count
-    }
-    
-    # Generate aggregated plot
-    if not args.no_plots:
-        plot_aggregated_mse_by_minus_level(aggregated_results, output_dir, all_mse_results)
-        folder_logger.info(f"Aggregated plot saved to: {output_dir}")
-    
-    folder_logger.info("\n" + "=" * 60)
-    folder_logger.info("AGGREGATED SUMMARY")
-    folder_logger.info("=" * 60)
-    folder_logger.info(f"Number of tensors: {successful_count}")
-    
-    if avg_mse_by_minus_level:
-        best_ml = min(avg_mse_by_minus_level, key=avg_mse_by_minus_level.get)
-        best_mse = avg_mse_by_minus_level[best_ml]
-        folder_logger.info(f"Best minus_level (average): {best_ml:.1f}")
-        folder_logger.info(f"Average MSE at best minus_level: {best_mse:.6e}")
-        
-        folder_logger.info("\nAverage MSE by minus_level:")
-        for ml in sorted(avg_mse_by_minus_level.keys()):
-            avg_mse = avg_mse_by_minus_level[ml]
-            std_mse = std_mse_by_minus_level.get(ml, 0)
-            folder_logger.info(f"  minus_level={ml}: {avg_mse:.6e} ± {std_mse:.6e}")
-    
-    folder_logger.info("=" * 60)
-    
-    return 0
-
-def plot_aggregated_mse_by_minus_level(aggregated_results, output_path, all_mse_results):
-    """
-    Plot aggregated MSE curve with average and standard deviation.
-    
-    Args:
-        aggregated_results (dict): Aggregated results structure
-        output_path (Path): Output directory for plots
-        all_mse_results (list): List of individual MSE results for error bars
-    """
-    elem_format = aggregated_results['elem_format']
-    
-    # Get aggregated MSE data
-    scale_key = 'scale_0'
-    if scale_key not in aggregated_results['metrics']:
-        return
-    
-    mse_info = aggregated_results['metrics'][scale_key].get('mse_info', {})
-    if 'mse_by_minus_level' not in mse_info or not mse_info['mse_by_minus_level']:
-        return
-    
-    # Collect MSE data
-    minus_level_mse = {}
-    minus_level_std = {}
-    
-    # Add base case (minus_level=0)
-    minus_level_mse[0] = mse_info.get('mse_scale', 0)
-    std_data = mse_info.get('mse_std_by_minus_level', {})
-    minus_level_std[0] = std_data.get(0, 0)
-    
-    # Add other minus_levels
-    for minus_level, mse in mse_info['mse_by_minus_level'].items():
-        minus_level_mse[minus_level] = mse
-        minus_level_std[minus_level] = std_data.get(minus_level, 0)
-    
-    if not minus_level_mse:
-        return
-    
-    # Get format info
-    format_params = aggregated_results.get('format_params', {})
-    num_tensors = aggregated_results.get('num_tensors', 0)
-    
-    # Sort minus_levels
-    minus_levels = sorted(minus_level_mse.keys())
-    mse_values = [minus_level_mse[ml] for ml in minus_levels]
-    std_values = [minus_level_std.get(ml, 0) for ml in minus_levels]
-    
-    # Find best minus_level
-    best_idx = np.argmin(mse_values)
-    best_ml = minus_levels[best_idx]
-    best_mse = mse_values[best_idx]
-    
-    # Create beautiful plot with modern style
-    try:
-        plt.style.use('seaborn-v0_8-darkgrid')
-    except:
-        try:
-            plt.style.use('seaborn-darkgrid')
-        except:
-            plt.style.use('default')
-    
-    fig, ax = plt.subplots(figsize=(12, 7))
-    
-    # Use a beautiful gradient color scheme
-    colors = plt.cm.plasma(np.linspace(0.2, 0.8, len(minus_levels)))
-    
-    # Plot main MSE curve with error bars
-    # First plot the line without markers
-    ax.errorbar(minus_levels, mse_values, yerr=std_values, 
-               fmt='-', linewidth=3.5, 
-               color='#4A90E2', alpha=0.8, zorder=2, 
-               capsize=5, capthick=2, elinewidth=2,
-               label='Average MSE', ecolor='#4A90E2')
-    
-    # Plot points with gradient colors and white edges
-    for i, (ml, mse) in enumerate(zip(minus_levels, mse_values)):
-        marker_size = 14 if ml == best_ml else 11
-        ax.plot(ml, mse, 'o', markersize=marker_size, color=colors[i], 
-               markeredgecolor='white', markeredgewidth=2.5, zorder=4)
-    
-    # Highlight the best point with a prominent star
-    ax.plot(best_ml, best_mse, '*', markersize=30, color='#FF6B6B', 
-           markeredgecolor='white', markeredgewidth=3, 
-           label=f'Best: minus_level={best_ml}', zorder=6)
-    
-    # Add value annotations
-    # Annotate best point prominently
-    ax.annotate(f'MSE={best_mse:.2e}', 
-               xy=(best_ml, best_mse), 
-               xytext=(15, 20), 
-               textcoords='offset points',
-               fontsize=11, 
-               fontweight='bold',
-               bbox=dict(boxstyle='round,pad=0.6', facecolor='#FF6B6B', alpha=0.9, 
-                        edgecolor='white', linewidth=2),
-               arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.2', 
-                             color='#FF6B6B', lw=2.5),
-               color='white', zorder=7)
-    
-    # Annotate first and last points
-    if len(minus_levels) > 2:
-        if minus_levels[0] != best_ml:
-            ax.annotate(f'{mse_values[0]:.2e}', 
-                       xy=(minus_levels[0], mse_values[0]), 
-                       xytext=(0, -25), 
-                       textcoords='offset points',
-                       fontsize=9,
-                       ha='center',
-                       bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
-                               alpha=0.9, edgecolor='#4A90E2', linewidth=1.5),
-                       color='#2C3E50', fontweight='bold')
-        
-        if minus_levels[-1] != best_ml:
-            ax.annotate(f'{mse_values[-1]:.2e}', 
-                       xy=(minus_levels[-1], mse_values[-1]), 
-                       xytext=(0, -25), 
-                       textcoords='offset points',
-                       fontsize=9,
-                       ha='center',
-                       bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
-                               alpha=0.9, edgecolor='#4A90E2', linewidth=1.5),
-                       color='#2C3E50', fontweight='bold')
-    
-    # Styling
-    ax.set_xlabel('Minus Level', fontsize=14, fontweight='bold', color='#333333')
-    ax.set_ylabel('MSE (log scale)', fontsize=14, fontweight='bold', color='#333333')
-    
-    # Enhanced title
-    title = f'Average MSE vs Minus Level Analysis - {elem_format.upper()}'
-    # if format_params:
-    #     title += f'\nFormat: E{format_params.get("ebits", 0)}M{format_params.get("mbits", 0)} | {num_tensors} tensors averaged'
-    ax.set_title(title, fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
-    
-    # Enhanced grid
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.7, color='#CCCCCC', zorder=1)
-    ax.set_axisbelow(True)
-    
-    # Set x-axis to show integer ticks
-    ax.set_xticks(minus_levels)
-    ax.set_xticklabels([f'{ml}' for ml in minus_levels], fontsize=12, fontweight='bold')
-    ax.tick_params(axis='x', length=6, width=1.5, colors='#333333')
-    
-    # Format y-axis
-    ax.tick_params(axis='y', labelsize=11, colors='#333333')
-    ax.tick_params(axis='y', length=6, width=1.5)
-    
-    # Use log scale for y-axis
-    ax.set_yscale('log')
-    
-    # Add legend
-    legend = ax.legend(loc='upper right', fontsize=12, framealpha=0.95, 
-                      fancybox=True, shadow=True, edgecolor='#CCCCCC', 
-                      facecolor='white', frameon=True)
-    legend.get_frame().set_linewidth(1.5)
-    
-    # Add background color
-    ax.set_facecolor('#F8F9FA')
-    fig.patch.set_facecolor('white')
-    
-    # Add subtle border
-    for spine in ax.spines.values():
-        spine.set_edgecolor('#E0E0E0')
-        spine.set_linewidth(1.5)
-    
-    plt.tight_layout()
-    
-    # Save plot
-    plot_path = output_path / f'mxfp_mse_by_minus_level_aggregated_{elem_format}.png'
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
-    plt.close()
-
 def main():
     """Main function for MXFP scaling test."""
     parser = argparse.ArgumentParser(description='Test different scaling strategies for MXFP quantization')
-    parser.add_argument('input_paths', nargs='+', 
-                        help='Path(s) to input BF16 tensor file(s) (.pt) or folder(s) containing .pt files')
+    parser.add_argument('input_tensors', nargs='+', help='Path(s) to input BF16 tensor file(s) (.pt)')
     parser.add_argument('--output-dir', default=None, 
                         help='Output directory for results (default: ./draw/scaling_analysis/{args.elem_format}/{tensor_name}/)')
     parser.add_argument('--elem-format', default='fp4_e2m1', 
@@ -1509,51 +1150,35 @@ def main():
     
     args = parser.parse_args()
     
-    # Process each input path (file or folder)
-    total_paths = len(args.input_paths)
+    # Process multiple tensors
+    total_tensors = len(args.input_tensors)
     successful_tests = 0
     
-    print(f"Processing {total_paths} path(s)...")
+    print(f"Processing {total_tensors} tensor(s)...")
     print("=" * 80)
     
-    for i, input_path_str in enumerate(args.input_paths, 1):
-        print(f"\n[{i}/{total_paths}] Processing: {input_path_str}")
+    for i, tensor_path in enumerate(args.input_tensors, 1):
+        print(f"\n[{i}/{total_tensors}] Processing: {tensor_path}")
         print("-" * 60)
         
-        input_path = Path(input_path_str)
+        input_path = Path(tensor_path)
+        result = process_single_tensor(input_path, args)
         
-        if not input_path.exists():
-            print(f"❌ Path does not exist: {input_path_str}")
-            continue
-        
-        if input_path.is_dir():
-            # Process folder
-            result = process_folder(input_path, args)
-            if result == 0:
-                successful_tests += 1
-                print(f"✅ Successfully processed folder: {input_path_str}")
-            else:
-                print(f"❌ Failed to process folder: {input_path_str}")
-        elif input_path.is_file():
-            # Process single file
-            result = process_single_tensor(input_path, args)
-            if result == 0:
-                successful_tests += 1
-                print(f"✅ Successfully processed: {input_path_str}")
-            else:
-                print(f"❌ Failed to process: {input_path_str}")
+        if result == 0:
+            successful_tests += 1
+            print(f"✅ Successfully processed: {tensor_path}")
         else:
-            print(f"❌ Invalid path (neither file nor directory): {input_path_str}")
+            print(f"❌ Failed to process: {tensor_path}")
     
     # Final summary
     print("\n" + "=" * 80)
     print("FINAL SUMMARY")
     print("=" * 80)
-    print(f"Total paths: {total_paths}")
+    print(f"Total tensors: {total_tensors}")
     print(f"Successful: {successful_tests}")
-    print(f"Failed: {total_paths - successful_tests}")
+    print(f"Failed: {total_tensors - successful_tests}")
     
-    if successful_tests == total_paths:
+    if successful_tests == total_tensors:
         print("🎉 All tests completed successfully!")
         return 0
     else:
