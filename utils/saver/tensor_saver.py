@@ -18,7 +18,7 @@ def update_global_step(step):
 
 def _simple_save(tensor, name_prefix):
     # 1. 检查步数 (只存 1 和 100)
-    if GLOBAL_STEP not in [1, 100]:
+    if GLOBAL_STEP not in []:
         return
     # 2. 检查 Rank (只在主卡存)
     if dist.is_initialized() and dist.get_rank() != 0:
