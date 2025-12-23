@@ -9,7 +9,7 @@ import torch
 import time
 from typing import Optional, Dict, Any
 from pathlib import Path
-from torch.distributed import dist
+import torch.distributed as dist
 GLOBAL_STEP = 0
 
 def update_global_step(step):
