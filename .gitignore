@@ -25,7 +25,7 @@ MANIFEST
 *.pth
 *.pt
 *.ckpt
-
+draw/
 # Jupyter Notebook
 .ipynb_checkpoints
 

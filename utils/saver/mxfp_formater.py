@@ -1416,7 +1416,7 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
         ax.set_xticks(range(len(sorted_values)))
         ax.set_xticklabels(labels, fontsize=12, fontweight='bold')
         ax.set_title(f'Value Distribution Analysis - {elem_format.upper()}\n'
-                     f'minus_exp={minus_exp} | {successful_count} tensors from {folder_path.name}',
+                     f'minus_exp={minus_exp} ',
                      fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
         
         # Grid
@@ -1434,9 +1434,16 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
         
         plt.tight_layout()
         
-        # Save plot with minus_exp in filename
-        plot_path = output_dir / f'value_distribution_{elem_format}_minus_exp_{minus_exp}_{folder_path.name}.png'
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        # Save plot with minus_exp in filename (high-resolution PDF)
+        plot_path = output_dir / f'value_distribution_{elem_format}_minus_exp_{minus_exp}_{folder_path.name}.pdf'
+        # Use high DPI for rasterized elements and ensure vector format
+        plt.savefig(plot_path, 
+                   format='pdf',
+                   dpi=600,  # High DPI for any rasterized elements
+                   bbox_inches='tight',
+                   facecolor='white',
+                   edgecolor='none',
+                   metadata={'Creator': 'MXFP Formatter', 'Title': f'Value Distribution - {elem_format} (minus_exp={minus_exp})'})
         plt.close()
         
         print(f"\n✅ Plot saved to: {plot_path}")

@@ -720,7 +720,6 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
     from quant.ops.mxfp import (
         _quantize_mx, calculate_minus_mse_exp, _shared_exponents, _get_format_params
     )
-    from utils.saver.mxfp_saver import _analyze_overflow_underflow_before_quantization
     
     A = input_tensor.clone()
     
@@ -756,37 +755,77 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
     best_minus_level = 0
     best_q_A = q_A_base
     
-    # Test different minus_level values
+    # Initialize results for both methods
+    mse_results_simple = {}  # Direct exponent adjustment
+    mse_results_auto = {}    # Auto Smax scheme combination
+    
+    best_mse_simple = mse_scale
+    best_minus_level_simple = 0
+    best_q_A_simple = q_A_base
+    
+    best_mse_auto = mse_scale
+    best_minus_level_auto = 0
+    best_q_A_auto = q_A_base
+    
+    # Test different minus_level values with both methods
     for minus_level in range(1, 8):
         tested_minus_levels.append(minus_level)
         
-        # Call _quantize_mx with auto minus_exp and specified minus_level
-        q_A_test = _quantize_mx(
+        # Method 1: Direct exponent adjustment (minus_exp=minus_level)
+        q_A_test_simple = _quantize_mx(
             A, scale_bits=scale_bits, elem_format=elem_format,
             shared_exp_method="max", axes=axes, block_size=block_size,
             round="nearest", flush_fp32_subnorms=False,
             minus_exp=minus_level, minus_level=None, heuristic_level=None
         )
+        mse_test_simple = torch.mean((A - q_A_test_simple) ** 2).item()
+        mse_results_simple[minus_level] = mse_test_simple
         
-        # Calculate MSE with original tensor
-        mse_test = torch.mean((A - q_A_test) ** 2).item()
-        mse_results[minus_level] = mse_test
+        if mse_test_simple < best_mse_simple:
+            best_mse_simple = mse_test_simple
+            best_minus_level_simple = minus_level
+            best_q_A_simple = q_A_test_simple
         
-        # Update best result if this minus_level is better
-        if mse_test < best_mse:
-            best_mse = mse_test
-            best_minus_level = minus_level
-            best_q_A = q_A_test
+        # Method 2: Auto Smax scheme combination (minus_exp="auto", minus_level=minus_level)
+        q_A_test_auto = _quantize_mx(
+            A, scale_bits=scale_bits, elem_format=elem_format,
+            shared_exp_method="max", axes=axes, block_size=block_size,
+            round="nearest", flush_fp32_subnorms=False,
+            minus_exp="auto", minus_level=minus_level, heuristic_level=None
+        )
+        mse_test_auto = torch.mean((A - q_A_test_auto) ** 2).item()
+        mse_results_auto[minus_level] = mse_test_auto
+        
+        if mse_test_auto < best_mse_auto:
+            best_mse_auto = mse_test_auto
+            best_minus_level_auto = minus_level
+            best_q_A_auto = q_A_test_auto
     
-    # Use best quantized tensor
-    q_A = best_q_A
+    # Use the best overall quantized tensor (choose between simple and auto)
+    if best_mse_simple <= best_mse_auto:
+        q_A = best_q_A_simple
+        best_mse = best_mse_simple
+        best_minus_level = best_minus_level_simple
+    else:
+        q_A = best_q_A_auto
+        best_mse = best_mse_auto
+        best_minus_level = best_minus_level_auto
         
-    # Prepare MSE info
+    # Prepare MSE info with both methods
     mse_info = {
         'mse_scale': mse_scale,
         'best_minus_level': float(best_minus_level),
         'tested_minus_levels': tested_minus_levels,
-        'mse_by_minus_level': mse_results,
+        # Simple exponent adjustment results
+        'mse_by_minus_level_simple': mse_results_simple,
+        'best_minus_level_simple': float(best_minus_level_simple),
+        'best_mse_simple': best_mse_simple,
+        # Auto Smax scheme combination results
+        'mse_by_minus_level_auto': mse_results_auto,
+        'best_minus_level_auto': float(best_minus_level_auto),
+        'best_mse_auto': best_mse_auto,
+        # For backward compatibility
+        'mse_by_minus_level': mse_results_simple,  # Default to simple method
     }
     
     return q_A, mse_info
@@ -808,15 +847,16 @@ def plot_mse_by_minus_level(results, output_path):
         return  # No data to plot
     
     mse_info = results['metrics'][scale_key].get('mse_info', {})
-    if 'mse_by_minus_level' not in mse_info or not mse_info['mse_by_minus_level']:
+    # Use simple exponent adjustment data
+    if 'mse_by_minus_level_simple' not in mse_info or not mse_info['mse_by_minus_level_simple']:
         return  # No minus_level data
     
-    # Collect MSE data
+    # Collect MSE data for simple exponent adjustment
     minus_level_mse = {}
     # Add base case (minus_level=0)
     minus_level_mse[0] = mse_info.get('mse_scale', 0)
     # Add other minus_levels
-    for minus_level, mse in mse_info['mse_by_minus_level'].items():
+    for minus_level, mse in mse_info['mse_by_minus_level_simple'].items():
         minus_level_mse[minus_level] = mse
     
     if not minus_level_mse:
@@ -908,10 +948,10 @@ def plot_mse_by_minus_level(results, output_path):
     ax.set_xlabel('Minus Level', fontsize=14, fontweight='bold', color='#333333')
     ax.set_ylabel('MSE (log scale)', fontsize=14, fontweight='bold', color='#333333')
     
-    # Enhanced title
-    title = f'MSE vs Minus Level Analysis - {elem_format.upper()}'
+    # Enhanced title - Simple Exponent Adjustment
+    title = f'Simple Exponent Adjustment MSE Analysis - {elem_format.upper()}'
     if format_params:
-        title += f'\nFormat: E{format_params.get("ebits", 0)}M{format_params.get("mbits", 0)} | Scale Exp: {scale_exp:.2f}'
+        title += f'\nFormat: E{format_params.get("ebits", 0)}M{format_params.get("mbits", 0)} | Scale Exp: {scale_exp:.2f} | Direct minus_exp'
     ax.set_title(title, fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
     
     # Enhanced grid with subtle styling
@@ -944,9 +984,179 @@ def plot_mse_by_minus_level(results, output_path):
     
     plt.tight_layout()
     
-    # Save plot with high quality
-    plot_path = output_path / f'mxfp_mse_by_minus_level_{elem_format}.png'
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    # Save plot with high-resolution PDF
+    plot_path = output_path / f'mxfp_simple_exponent_adjustment_mse_{elem_format}.pdf'
+    plt.savefig(plot_path, 
+               format='pdf',
+               dpi=600,  # High DPI for any rasterized elements
+               bbox_inches='tight',
+               facecolor='white',
+               edgecolor='none',
+               metadata={'Creator': 'MXFP Scaling Test', 'Title': f'Simple Exponent Adjustment MSE - {elem_format}'})
+    plt.close()
+
+def plot_auto_smax_mse_by_minus_level(results, output_path):
+    """
+    Plot beautiful MSE curve for different minus_level values using auto Smax scheme combination.
+    
+    Args:
+        results (dict): Results from test_scaling_levels
+        output_path (Path): Output directory for plots
+    """
+    elem_format = results['elem_format']
+    
+    # Get the single scale_exp result
+    scale_key = 'scale_0'
+    if scale_key not in results['metrics']:
+        return  # No data to plot
+    
+    mse_info = results['metrics'][scale_key].get('mse_info', {})
+    # Use auto Smax scheme combination data
+    if 'mse_by_minus_level_auto' not in mse_info or not mse_info['mse_by_minus_level_auto']:
+        return  # No minus_level data
+    
+    # Collect MSE data for auto Smax scheme combination
+    minus_level_mse = {}
+    # Add base case (minus_level=0)
+    minus_level_mse[0] = mse_info.get('mse_scale', 0)
+    # Add other minus_levels
+    for minus_level, mse in mse_info['mse_by_minus_level_auto'].items():
+        minus_level_mse[minus_level] = mse
+    
+    if not minus_level_mse:
+        return  # No data to plot
+    
+    # Get scale_exp and format info for title
+    scale_exp = results['metrics'][scale_key].get('scale_exponent', 0)
+    format_params = results.get('format_params', {})
+    
+    # Sort minus_levels
+    minus_levels = sorted(minus_level_mse.keys())
+    mse_values = [minus_level_mse[ml] for ml in minus_levels]
+    
+    # Find best minus_level
+    best_idx = np.argmin(mse_values)
+    best_ml = minus_levels[best_idx]
+    best_mse = mse_values[best_idx]
+    
+    # Create beautiful plot with modern style
+    try:
+        plt.style.use('seaborn-v0_8-darkgrid')
+    except:
+        try:
+            plt.style.use('seaborn-darkgrid')
+        except:
+            plt.style.use('default')
+    
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Use a beautiful gradient color scheme (green to orange)
+    colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(minus_levels)))
+    
+    # Plot main MSE curve with smooth gradient
+    line = ax.semilogy(minus_levels, mse_values, '-', linewidth=3.5, 
+                      color='#2ECC71', alpha=0.8, zorder=2, label='MSE Curve')
+    
+    # Plot points with gradient colors and white edges
+    for i, (ml, mse) in enumerate(zip(minus_levels, mse_values)):
+        marker_size = 14 if ml == best_ml else 11
+        ax.plot(ml, mse, 'o', markersize=marker_size, color=colors[i], 
+               markeredgecolor='white', markeredgewidth=2.5, zorder=4)
+    
+    # Highlight the best point with a prominent star
+    ax.plot(best_ml, best_mse, '*', markersize=30, color='#E74C3C', 
+           markeredgecolor='white', markeredgewidth=3, 
+           label=f'Best: minus_level={best_ml}', zorder=6)
+    
+    # Add value annotations - only for key points to avoid clutter
+    # Annotate best point prominently
+    ax.annotate(f'MSE={best_mse:.2e}', 
+               xy=(best_ml, best_mse), 
+               xytext=(15, 20), 
+               textcoords='offset points',
+               fontsize=11, 
+               fontweight='bold',
+               bbox=dict(boxstyle='round,pad=0.6', facecolor='#E74C3C', alpha=0.9, 
+                        edgecolor='white', linewidth=2),
+               arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.2', 
+                             color='#E74C3C', lw=2.5),
+               color='white', zorder=7)
+    
+    # Annotate first and last points
+    if len(minus_levels) > 2:
+        # First point
+        if minus_levels[0] != best_ml:
+            ax.annotate(f'{mse_values[0]:.2e}', 
+                       xy=(minus_levels[0], mse_values[0]), 
+                       xytext=(0, -25), 
+                       textcoords='offset points',
+                       fontsize=9,
+                       ha='center',
+                       bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
+                               alpha=0.9, edgecolor='#2ECC71', linewidth=1.5),
+                       color='#2C3E50', fontweight='bold')
+        
+        # Last point
+        if minus_levels[-1] != best_ml:
+            ax.annotate(f'{mse_values[-1]:.2e}', 
+                       xy=(minus_levels[-1], mse_values[-1]), 
+                       xytext=(0, -25), 
+                       textcoords='offset points',
+                       fontsize=9,
+                       ha='center',
+                       bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
+                               alpha=0.9, edgecolor='#2ECC71', linewidth=1.5),
+                       color='#2C3E50', fontweight='bold')
+    
+    # Styling
+    ax.set_xlabel('Minus Level', fontsize=14, fontweight='bold', color='#333333')
+    ax.set_ylabel('MSE (log scale)', fontsize=14, fontweight='bold', color='#333333')
+    
+    # Enhanced title - Auto Smax Scheme Combination
+    title = f'Auto Smax Scheme Combination MSE Analysis - {elem_format.upper()}'
+    if format_params:
+        title += f'\nFormat: E{format_params.get("ebits", 0)}M{format_params.get("mbits", 0)} | Scale Exp: {scale_exp:.2f} | minus_exp="auto"'
+    ax.set_title(title, fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
+    
+    # Enhanced grid with subtle styling
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.7, color='#CCCCCC', zorder=1)
+    ax.set_axisbelow(True)
+    
+    # Set x-axis to show integer ticks with better formatting
+    ax.set_xticks(minus_levels)
+    ax.set_xticklabels([f'{ml}' for ml in minus_levels], fontsize=12, fontweight='bold')
+    ax.tick_params(axis='x', length=6, width=1.5, colors='#333333')
+    
+    # Format y-axis with better styling
+    ax.tick_params(axis='y', labelsize=11, colors='#333333')
+    ax.tick_params(axis='y', length=6, width=1.5)
+    
+    # Add legend with elegant styling
+    legend = ax.legend(loc='upper right', fontsize=12, framealpha=0.95, 
+                      fancybox=True, shadow=True, edgecolor='#CCCCCC', 
+                      facecolor='white', frameon=True)
+    legend.get_frame().set_linewidth(1.5)
+    
+    # Add subtle background color
+    ax.set_facecolor('#F8F9FA')
+    fig.patch.set_facecolor('white')
+    
+    # Add subtle border to the plot
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#E0E0E0')
+        spine.set_linewidth(1.5)
+    
+    plt.tight_layout()
+    
+    # Save plot with high-resolution PDF
+    plot_path = output_path / f'mxfp_auto_smax_scheme_mse_{elem_format}.pdf'
+    plt.savefig(plot_path, 
+               format='pdf',
+               dpi=600,  # High DPI for any rasterized elements
+               bbox_inches='tight',
+               facecolor='white',
+               edgecolor='none',
+               metadata={'Creator': 'MXFP Scaling Test', 'Title': f'Auto Smax Scheme Combination MSE - {elem_format}'})
     plt.close()
 
 def save_results_to_file(results, output_path):
@@ -1086,10 +1296,11 @@ def process_single_tensor(input_path, args, logger=None):
     save_results_to_file(results, output_dir)
     tensor_logger.info(f"Detailed results saved to: {output_dir}")
     
-    # Generate MSE by minus_level plot unless disabled
+    # Generate MSE by minus_level plots unless disabled
     if not args.no_plots:
         plot_mse_by_minus_level(results, output_dir)
-        tensor_logger.info(f"Plot saved to: {output_dir}")
+        plot_auto_smax_mse_by_minus_level(results, output_dir)
+        tensor_logger.info(f"Plots saved to: {output_dir}")
     
     # Print summary
     tensor_logger.info("\n" + "=" * 60)
@@ -1171,8 +1382,9 @@ def process_folder(input_folder, args):
     folder_logger.info(f"Found {len(tensor_files)} tensor files")
     folder_logger.info("=" * 60)
     
-    # Collect all MSE results
-    all_mse_results = []  # List of {minus_level: mse} dicts
+    # Collect all MSE results for both methods
+    all_mse_results_simple = []  # List of {minus_level: mse} dicts for simple method
+    all_mse_results_auto = []    # List of {minus_level: mse} dicts for auto method
     successful_count = 0
     
     for i, tensor_file in enumerate(tensor_files, 1):
@@ -1213,14 +1425,22 @@ def process_folder(input_folder, args):
                 ebits, mbits, max_norm, axes=axes, block_size=block_size
             )
             
-            # Collect MSE data
-            mse_data = {}
-            mse_data[0] = mse_info.get('mse_scale', 0)
-            if 'mse_by_minus_level' in mse_info:
-                for minus_level, mse in mse_info['mse_by_minus_level'].items():
-                    mse_data[minus_level] = mse
+            # Collect MSE data for simple method
+            mse_data_simple = {}
+            mse_data_simple[0] = mse_info.get('mse_scale', 0)
+            if 'mse_by_minus_level_simple' in mse_info:
+                for minus_level, mse in mse_info['mse_by_minus_level_simple'].items():
+                    mse_data_simple[minus_level] = mse
             
-            all_mse_results.append(mse_data)
+            # Collect MSE data for auto method
+            mse_data_auto = {}
+            mse_data_auto[0] = mse_info.get('mse_scale', 0)
+            if 'mse_by_minus_level_auto' in mse_info:
+                for minus_level, mse in mse_info['mse_by_minus_level_auto'].items():
+                    mse_data_auto[minus_level] = mse
+            
+            all_mse_results_simple.append(mse_data_simple)
+            all_mse_results_auto.append(mse_data_auto)
             successful_count += 1
             
             folder_logger.info(f"  ✅ Processed: {tensor_file.name}")
@@ -1231,38 +1451,54 @@ def process_folder(input_folder, args):
             folder_logger.error(f"  ❌ Error processing {tensor_file.name}: {str(e)}")
             continue
     
-    if not all_mse_results:
+    if not all_mse_results_simple and not all_mse_results_auto:
         folder_logger.error("No successful tensor processing. Cannot generate aggregated plot.")
         return 1
     
-    # Calculate aggregated statistics
+    # Calculate aggregated statistics for both methods
     folder_logger.info("\n" + "=" * 60)
     folder_logger.info("AGGREGATING RESULTS")
     folder_logger.info("=" * 60)
     folder_logger.info(f"Successfully processed: {successful_count}/{len(tensor_files)} tensors")
     
-    # Get all minus_levels that appear in any result
-    all_minus_levels = set()
-    for mse_data in all_mse_results:
-        all_minus_levels.update(mse_data.keys())
-    all_minus_levels = sorted(all_minus_levels)
+    # Process simple method
+    all_minus_levels_simple = set()
+    for mse_data in all_mse_results_simple:
+        all_minus_levels_simple.update(mse_data.keys())
+    all_minus_levels_simple = sorted(all_minus_levels_simple)
     
-    # Calculate average MSE for each minus_level
-    avg_mse_by_minus_level = {}
-    std_mse_by_minus_level = {}
+    avg_mse_by_minus_level_simple = {}
+    std_mse_by_minus_level_simple = {}
     
-    for ml in all_minus_levels:
+    for ml in all_minus_levels_simple:
         mse_values = []
-        for mse_data in all_mse_results:
+        for mse_data in all_mse_results_simple:
             if ml in mse_data:
                 mse_values.append(mse_data[ml])
-        
         if mse_values:
-            avg_mse_by_minus_level[ml] = np.mean(mse_values)
-            std_mse_by_minus_level[ml] = np.std(mse_values)
+            avg_mse_by_minus_level_simple[ml] = np.mean(mse_values)
+            std_mse_by_minus_level_simple[ml] = np.std(mse_values)
     
-    # Create aggregated results structure
-    aggregated_results = {
+    # Process auto method
+    all_minus_levels_auto = set()
+    for mse_data in all_mse_results_auto:
+        all_minus_levels_auto.update(mse_data.keys())
+    all_minus_levels_auto = sorted(all_minus_levels_auto)
+    
+    avg_mse_by_minus_level_auto = {}
+    std_mse_by_minus_level_auto = {}
+    
+    for ml in all_minus_levels_auto:
+        mse_values = []
+        for mse_data in all_mse_results_auto:
+            if ml in mse_data:
+                mse_values.append(mse_data[ml])
+        if mse_values:
+            avg_mse_by_minus_level_auto[ml] = np.mean(mse_values)
+            std_mse_by_minus_level_auto[ml] = np.std(mse_values)
+    
+    # Create aggregated results structure for simple method
+    aggregated_results_simple = {
         'elem_format': args.elem_format,
         'scale_bits': args.scale_bits,
         'format_params': {
@@ -1274,13 +1510,14 @@ def process_folder(input_folder, args):
         },
         'metrics': {
             'scale_0': {
-                'scale_exponent': 0.0,  # Placeholder
+                'scale_exponent': 0.0,
                 'mse_info': {
-                    'mse_scale': avg_mse_by_minus_level.get(0, 0),
-                    'mse_by_minus_level': {k: v for k, v in avg_mse_by_minus_level.items() if k != 0},
-                    'best_minus_level': float(min(avg_mse_by_minus_level, key=avg_mse_by_minus_level.get)) if avg_mse_by_minus_level else 0.0,
-                    'tested_minus_levels': all_minus_levels,
-                    'mse_std_by_minus_level': std_mse_by_minus_level
+                    'mse_scale': avg_mse_by_minus_level_simple.get(0, 0),
+                    'mse_by_minus_level_simple': {k: v for k, v in avg_mse_by_minus_level_simple.items() if k != 0},
+                    'best_minus_level': float(min(avg_mse_by_minus_level_simple, key=avg_mse_by_minus_level_simple.get)) if avg_mse_by_minus_level_simple else 0.0,
+                    'tested_minus_levels': all_minus_levels_simple,
+                    'mse_std_by_minus_level': std_mse_by_minus_level_simple,
+                    'mse_by_minus_level': {k: v for k, v in avg_mse_by_minus_level_simple.items() if k != 0}  # For backward compatibility
                 }
             }
         },
@@ -1288,26 +1525,72 @@ def process_folder(input_folder, args):
         'num_tensors': successful_count
     }
     
-    # Generate aggregated plot
+    # Create aggregated results structure for auto method
+    aggregated_results_auto = {
+        'elem_format': args.elem_format,
+        'scale_bits': args.scale_bits,
+        'format_params': {
+            'ebits': ebits,
+            'mbits': mbits,
+            'emax': emax,
+            'max_norm': max_norm,
+            'min_norm': min_norm
+        },
+        'metrics': {
+            'scale_0': {
+                'scale_exponent': 0.0,
+                'mse_info': {
+                    'mse_scale': avg_mse_by_minus_level_auto.get(0, 0),
+                    'mse_by_minus_level_auto': {k: v for k, v in avg_mse_by_minus_level_auto.items() if k != 0},
+                    'best_minus_level': float(min(avg_mse_by_minus_level_auto, key=avg_mse_by_minus_level_auto.get)) if avg_mse_by_minus_level_auto else 0.0,
+                    'tested_minus_levels': all_minus_levels_auto,
+                    'mse_std_by_minus_level': std_mse_by_minus_level_auto,
+                    'mse_by_minus_level': {k: v for k, v in avg_mse_by_minus_level_auto.items() if k != 0}  # For backward compatibility
+                }
+            }
+        },
+        'scale_exponents': [0.0],
+        'num_tensors': successful_count
+    }
+    
+    # Generate aggregated plots for both methods
     if not args.no_plots:
-        plot_aggregated_mse_by_minus_level(aggregated_results, output_dir, all_mse_results)
-        folder_logger.info(f"Aggregated plot saved to: {output_dir}")
+        plot_aggregated_mse_by_minus_level(aggregated_results_simple, output_dir, all_mse_results_simple)
+        # Create a function to plot auto method aggregated results
+        plot_aggregated_auto_smax_mse_by_minus_level(aggregated_results_auto, output_dir, all_mse_results_auto)
+        folder_logger.info(f"Aggregated plots saved to: {output_dir}")
     
     folder_logger.info("\n" + "=" * 60)
     folder_logger.info("AGGREGATED SUMMARY")
     folder_logger.info("=" * 60)
     folder_logger.info(f"Number of tensors: {successful_count}")
     
-    if avg_mse_by_minus_level:
-        best_ml = min(avg_mse_by_minus_level, key=avg_mse_by_minus_level.get)
-        best_mse = avg_mse_by_minus_level[best_ml]
+    # Simple method summary
+    if avg_mse_by_minus_level_simple:
+        folder_logger.info("\n--- Simple Exponent Adjustment Method ---")
+        best_ml = min(avg_mse_by_minus_level_simple, key=avg_mse_by_minus_level_simple.get)
+        best_mse = avg_mse_by_minus_level_simple[best_ml]
         folder_logger.info(f"Best minus_level (average): {best_ml:.1f}")
         folder_logger.info(f"Average MSE at best minus_level: {best_mse:.6e}")
         
         folder_logger.info("\nAverage MSE by minus_level:")
-        for ml in sorted(avg_mse_by_minus_level.keys()):
-            avg_mse = avg_mse_by_minus_level[ml]
-            std_mse = std_mse_by_minus_level.get(ml, 0)
+        for ml in sorted(avg_mse_by_minus_level_simple.keys()):
+            avg_mse = avg_mse_by_minus_level_simple[ml]
+            std_mse = std_mse_by_minus_level_simple.get(ml, 0)
+            folder_logger.info(f"  minus_level={ml}: {avg_mse:.6e} ± {std_mse:.6e}")
+    
+    # Auto method summary
+    if avg_mse_by_minus_level_auto:
+        folder_logger.info("\n--- Auto Smax Scheme Combination Method ---")
+        best_ml = min(avg_mse_by_minus_level_auto, key=avg_mse_by_minus_level_auto.get)
+        best_mse = avg_mse_by_minus_level_auto[best_ml]
+        folder_logger.info(f"Best minus_level (average): {best_ml:.1f}")
+        folder_logger.info(f"Average MSE at best minus_level: {best_mse:.6e}")
+        
+        folder_logger.info("\nAverage MSE by minus_level:")
+        for ml in sorted(avg_mse_by_minus_level_auto.keys()):
+            avg_mse = avg_mse_by_minus_level_auto[ml]
+            std_mse = std_mse_by_minus_level_auto.get(ml, 0)
             folder_logger.info(f"  minus_level={ml}: {avg_mse:.6e} ± {std_mse:.6e}")
     
     folder_logger.info("=" * 60)
@@ -1331,10 +1614,11 @@ def plot_aggregated_mse_by_minus_level(aggregated_results, output_path, all_mse_
         return
     
     mse_info = aggregated_results['metrics'][scale_key].get('mse_info', {})
-    if 'mse_by_minus_level' not in mse_info or not mse_info['mse_by_minus_level']:
+    # Use simple method data
+    if 'mse_by_minus_level_simple' not in mse_info or not mse_info['mse_by_minus_level_simple']:
         return
     
-    # Collect MSE data
+    # Collect MSE data for simple method
     minus_level_mse = {}
     minus_level_std = {}
     
@@ -1344,7 +1628,7 @@ def plot_aggregated_mse_by_minus_level(aggregated_results, output_path, all_mse_
     minus_level_std[0] = std_data.get(0, 0)
     
     # Add other minus_levels
-    for minus_level, mse in mse_info['mse_by_minus_level'].items():
+    for minus_level, mse in mse_info['mse_by_minus_level_simple'].items():
         minus_level_mse[minus_level] = mse
         minus_level_std[minus_level] = std_data.get(minus_level, 0)
     
@@ -1440,10 +1724,8 @@ def plot_aggregated_mse_by_minus_level(aggregated_results, output_path, all_mse_
     ax.set_xlabel('Minus Level', fontsize=14, fontweight='bold', color='#333333')
     ax.set_ylabel('MSE (log scale)', fontsize=14, fontweight='bold', color='#333333')
     
-    # Enhanced title
-    title = f'Average MSE vs Minus Level Analysis - {elem_format.upper()}'
-    # if format_params:
-    #     title += f'\nFormat: E{format_params.get("ebits", 0)}M{format_params.get("mbits", 0)} | {num_tensors} tensors averaged'
+    # Enhanced title - Simple Exponent Adjustment (Aggregated)
+    title = f'Simple Exponent Adjustment Average MSE Analysis - {elem_format.upper()}'
     ax.set_title(title, fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
     
     # Enhanced grid
@@ -1479,9 +1761,180 @@ def plot_aggregated_mse_by_minus_level(aggregated_results, output_path, all_mse_
     
     plt.tight_layout()
     
-    # Save plot
-    plot_path = output_path / f'mxfp_mse_by_minus_level_aggregated_{elem_format}.png'
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    # Save plot with high-resolution PDF
+    plot_path = output_path / f'mxfp_simple_exponent_adjustment_mse_aggregated_{elem_format}.pdf'
+    plt.savefig(plot_path, 
+               format='pdf',
+               dpi=600,  # High DPI for any rasterized elements
+               bbox_inches='tight',
+               facecolor='white',
+               edgecolor='none',
+               metadata={'Creator': 'MXFP Scaling Test', 'Title': f'Simple Exponent Adjustment Aggregated MSE - {elem_format}'})
+    plt.close()
+
+def plot_aggregated_auto_smax_mse_by_minus_level(aggregated_results, output_path, all_mse_results):
+    """
+    Plot aggregated MSE curve with average and standard deviation for auto Smax scheme combination.
+    
+    Args:
+        aggregated_results (dict): Aggregated results structure
+        output_path (Path): Output directory for plots
+        all_mse_results (list): List of individual MSE results for error bars
+    """
+    elem_format = aggregated_results['elem_format']
+    
+    # Get aggregated MSE data
+    scale_key = 'scale_0'
+    if scale_key not in aggregated_results['metrics']:
+        return
+    
+    mse_info = aggregated_results['metrics'][scale_key].get('mse_info', {})
+    # Use auto method data
+    if 'mse_by_minus_level_auto' not in mse_info or not mse_info['mse_by_minus_level_auto']:
+        return
+    
+    # Collect MSE data for auto method
+    minus_level_mse = {}
+    minus_level_std = {}
+    
+    # Add base case (minus_level=0)
+    minus_level_mse[0] = mse_info.get('mse_scale', 0)
+    std_data = mse_info.get('mse_std_by_minus_level', {})
+    minus_level_std[0] = std_data.get(0, 0)
+    
+    # Add other minus_levels
+    for minus_level, mse in mse_info['mse_by_minus_level_auto'].items():
+        minus_level_mse[minus_level] = mse
+        minus_level_std[minus_level] = std_data.get(minus_level, 0)
+    
+    if not minus_level_mse:
+        return
+    
+    # Get format info
+    format_params = aggregated_results.get('format_params', {})
+    num_tensors = aggregated_results.get('num_tensors', 0)
+    
+    # Sort minus_levels
+    minus_levels = sorted(minus_level_mse.keys())
+    mse_values = [minus_level_mse[ml] for ml in minus_levels]
+    std_values = [minus_level_std.get(ml, 0) for ml in minus_levels]
+    
+    # Find best minus_level
+    best_idx = np.argmin(mse_values)
+    best_ml = minus_levels[best_idx]
+    best_mse = mse_values[best_idx]
+    
+    # Create beautiful plot with modern style
+    try:
+        plt.style.use('seaborn-v0_8-darkgrid')
+    except:
+        try:
+            plt.style.use('seaborn-darkgrid')
+        except:
+            plt.style.use('default')
+    
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Use a beautiful gradient color scheme (purple to orange)
+    colors = plt.cm.coolwarm(np.linspace(0.2, 0.8, len(minus_levels)))
+    
+    # Plot main MSE curve with error bars (using purple/orange color scheme)
+    ax.errorbar(minus_levels, mse_values, yerr=std_values, 
+               fmt='-', linewidth=3.5, 
+               color='#9B59B6', alpha=0.8, zorder=2, 
+               capsize=5, capthick=2, elinewidth=2,
+               label='Average MSE', ecolor='#9B59B6')
+    
+    # Plot points with gradient colors and white edges
+    for i, (ml, mse) in enumerate(zip(minus_levels, mse_values)):
+        marker_size = 14 if ml == best_ml else 11
+        ax.plot(ml, mse, 'o', markersize=marker_size, color=colors[i], 
+               markeredgecolor='white', markeredgewidth=2.5, zorder=4)
+    
+    # Highlight the best point with a prominent star
+    ax.plot(best_ml, best_mse, '*', markersize=30, color='#FF6B6B', 
+           markeredgecolor='white', markeredgewidth=3, 
+           label=f'Best: minus_level={best_ml}', zorder=6)
+    
+    # Add value annotations
+    # Best point: show both MSE and Minus_Level prominently
+    ax.annotate(f'ML={best_ml}\nMSE={best_mse:.2e}', 
+               xy=(best_ml, best_mse), 
+               xytext=(15, 20), 
+               textcoords='offset points',
+               fontsize=10, 
+               fontweight='bold',
+               ha='left',
+               bbox=dict(boxstyle='round,pad=0.6', facecolor='#FF6B6B', alpha=0.9, 
+                        edgecolor='white', linewidth=2),
+               arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.2', 
+                             color='#FF6B6B', lw=2.5),
+               color='white', zorder=7)
+    
+    # Other points: show MSE value only (like first and last points)
+    if len(minus_levels) > 1:
+        for ml, mse in zip(minus_levels, mse_values):
+            if ml != best_ml:
+                ax.annotate(f'{mse:.2e}', 
+                           xy=(ml, mse), 
+                           xytext=(0, -25), 
+                           textcoords='offset points',
+                           fontsize=9,
+                           ha='center',
+                           bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
+                                   alpha=0.9, edgecolor='#9B59B6', linewidth=1.5),
+                           color='#2C3E50', fontweight='bold', zorder=5)
+    
+    # Styling
+    ax.set_xlabel('Minus Level', fontsize=14, fontweight='bold', color='#333333')
+    ax.set_ylabel('MSE (log scale)', fontsize=14, fontweight='bold', color='#333333')
+    
+    # Enhanced title - Auto Smax Scheme Combination (Aggregated)
+    title = f'Auto Smax Scheme Combination Average MSE Analysis - {elem_format.upper()}'
+    ax.set_title(title, fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
+    
+    # Enhanced grid
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.7, color='#CCCCCC', zorder=1)
+    ax.set_axisbelow(True)
+    
+    # Set x-axis to show integer ticks
+    ax.set_xticks(minus_levels)
+    ax.set_xticklabels([f'{ml}' for ml in minus_levels], fontsize=12, fontweight='bold')
+    ax.tick_params(axis='x', length=6, width=1.5, colors='#333333')
+    
+    # Format y-axis
+    ax.tick_params(axis='y', labelsize=11, colors='#333333')
+    ax.tick_params(axis='y', length=6, width=1.5)
+    
+    # Use log scale for y-axis
+    ax.set_yscale('log')
+    
+    # Add legend
+    legend = ax.legend(loc='upper right', fontsize=12, framealpha=0.95, 
+                      fancybox=True, shadow=True, edgecolor='#CCCCCC', 
+                      facecolor='white', frameon=True)
+    legend.get_frame().set_linewidth(1.5)
+    
+    # Add background color
+    ax.set_facecolor('#F8F9FA')
+    fig.patch.set_facecolor('white')
+    
+    # Add subtle border
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#E0E0E0')
+        spine.set_linewidth(1.5)
+    
+    plt.tight_layout()
+    
+    # Save plot with high-resolution PDF
+    plot_path = output_path / f'mxfp_auto_smax_scheme_mse_aggregated_{elem_format}.pdf'
+    plt.savefig(plot_path, 
+               format='pdf',
+               dpi=600,  # High DPI for any rasterized elements
+               bbox_inches='tight',
+               facecolor='white',
+               edgecolor='none',
+               metadata={'Creator': 'MXFP Scaling Test', 'Title': f'Auto Smax Scheme Combination Aggregated MSE - {elem_format}'})
     plt.close()
 
 def main():
