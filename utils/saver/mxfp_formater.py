@@ -2,6 +2,8 @@ import torch
 # import torch_npu
 from enum import Enum, IntEnum
 import numpy as np
+import json
+from pathlib import Path
 
 
 FP32_EXPONENT_BIAS = 127
@@ -85,7 +87,7 @@ def _analyze_overflow_underflow_before_quantization(A, elem_format, mbits, ebits
             A_float = A.float()
         else:
             A_float = A
-        
+            
         # Detach from computation graph if needed, then convert to numpy
         if A_float.is_cuda:
             A_np = A_float.detach().cpu().numpy()
@@ -1249,6 +1251,59 @@ def _quantize_mx_with_statistics(
     return A_quantized, distribution_stats
 
 
+def save_value_distribution_data(all_results, data_file_path):
+    """
+    Save value distribution data to JSON file for later reuse.
+    
+    Args:
+        all_results (dict): Results from analyze_folder_value_distribution
+        data_file_path (Path): Path to save the data file
+    """
+    data_file_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Convert to JSON-serializable format
+    def convert_to_json_serializable(obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {str(k): convert_to_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_json_serializable(item) for item in obj]
+        return obj
+    
+    plot_data = convert_to_json_serializable(all_results)
+    
+    with open(data_file_path, 'w', encoding='utf-8') as f:
+        json.dump(plot_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"✅ Value distribution data saved to: {data_file_path}")
+
+def load_value_distribution_data(data_file_path):
+    """
+    Load value distribution data from JSON file.
+    
+    Args:
+        data_file_path (Path): Path to the data file
+        
+    Returns:
+        dict: Plot data dictionary, or None if file doesn't exist
+    """
+    if not data_file_path.exists():
+        return None
+    
+    try:
+        with open(data_file_path, 'r', encoding='utf-8') as f:
+            plot_data = json.load(f)
+        print(f"✅ Value distribution data loaded from: {data_file_path}")
+        return plot_data
+    except Exception as e:
+        print(f"⚠️  Error loading value distribution data: {e}")
+        return None
+
 def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1', 
                                       target_values=[0, 0.5, 1, 1.5, 2, 3, 4, 6],
                                       output_dir=None, scale_bits=8, block_size=32, axes=-1,
@@ -1291,6 +1346,103 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
     else:
         output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Setup data file path
+    data_dir = Path("./draw/input/value_distribution")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    data_file_path = data_dir / f"{folder_path.name}_{elem_format}_plot_data.json"
+    
+    # Check if plot data exists
+    plot_data = load_value_distribution_data(data_file_path)
+    if plot_data is not None:
+        print(f"Found existing plot data, skipping computation")
+        print(f"To recompute, delete: {data_file_path}")
+        
+        # Generate plots from loaded data
+        for minus_exp_str, result_data in plot_data.items():
+            # Convert minus_exp from string to int (JSON loads keys as strings)
+            minus_exp = int(minus_exp_str)
+            aggregated_dist = result_data['aggregated_dist']
+            successful_count = result_data['successful_count']
+            
+            # Prepare data for plotting
+            # Convert keys to float for sorting, but keep original string keys for access
+            # Sort by float value but use original string keys
+            key_value_pairs = [(float(k), k) for k in aggregated_dist.keys()]
+            key_value_pairs.sort(key=lambda x: x[0])  # Sort by float value
+            
+            sorted_values = [v for v, _ in key_value_pairs]  # Float values for labels
+            sorted_keys = [k for _, k in key_value_pairs]    # Original string keys for access
+            
+            percentages = [aggregated_dist[k]['avg_percent'] for k in sorted_keys]
+            std_percentages = [aggregated_dist[k].get('std_percent', 0) for k in sorted_keys]
+            labels = [f'{v:+.1f}' if v != 0 else '0' for v in sorted_values]
+            
+            # Create beautiful plot
+            try:
+                plt.style.use('seaborn-v0_8-darkgrid')
+            except:
+                try:
+                    plt.style.use('seaborn-darkgrid')
+                except:
+                    plt.style.use('default')
+            
+            fig, ax = plt.subplots(figsize=(14, 8))
+            
+            # Use gradient colors
+            colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(sorted_values)))
+            
+            # Create bar plot with error bars
+            bars = ax.bar(range(len(sorted_values)), percentages, 
+                          yerr=std_percentages,
+                          color=colors, alpha=0.8, edgecolor='white', linewidth=2,
+                          error_kw={'elinewidth': 2, 'ecolor': '#333333', 'capsize': 5})
+            
+            # Add value labels on bars
+            for i, (bar, pct, std) in enumerate(zip(bars, percentages, std_percentages)):
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height + std + 0.5,
+                        f'{pct:.2f}%',
+                        ha='center', va='bottom', fontsize=10, fontweight='bold')
+            
+            # Styling
+            ax.set_xlabel('Quantized Values', fontsize=14, fontweight='bold', color='#333333')
+            ax.set_ylabel('Percentage (%)', fontsize=14, fontweight='bold', color='#333333')
+            ax.set_xticks(range(len(sorted_values)))
+            ax.set_xticklabels(labels, fontsize=12, fontweight='bold')
+            ax.set_title(f'Value Distribution Analysis - {elem_format.upper()}\n'
+                         f'minus_exp={minus_exp} ',
+                         fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
+            
+            # Grid
+            ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.7, color='#CCCCCC', axis='y')
+            ax.set_axisbelow(True)
+            
+            # Background
+            ax.set_facecolor('#F8F9FA')
+            fig.patch.set_facecolor('white')
+            
+            # Border
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#E0E0E0')
+                spine.set_linewidth(1.5)
+            
+            plt.tight_layout()
+            
+            # Save plot with minus_exp in filename (high-resolution PDF)
+            plot_path = output_dir / f'value_distribution_{elem_format}_minus_exp_{minus_exp}_{folder_path.name}.pdf'
+            plt.savefig(plot_path, 
+                       format='pdf',
+                       dpi=600,  # High DPI for any rasterized elements
+                       bbox_inches='tight',
+                       facecolor='white',
+                       edgecolor='none',
+                       metadata={'Creator': 'MXFP Formatter', 'Title': f'Value Distribution - {elem_format} (minus_exp={minus_exp})'})
+            plt.close()
+            
+            print(f"\n✅ Plot saved to: {plot_path}")
+        
+        return plot_data
     
     # Process each minus_exp value
     all_results = {}
@@ -1457,6 +1609,9 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
             print(f"Value {value:+.1f}: {stats['avg_percent']:.2f}% ± {stats.get('std_percent', 0):.2f}% "
                   f"(total count: {stats['count']:,})")
         print("=" * 60)
+    
+    # Save plot data for future reuse
+    save_value_distribution_data(all_results, data_file_path)
     
     return all_results
 

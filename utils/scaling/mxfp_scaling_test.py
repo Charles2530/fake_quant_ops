@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 import os
 import logging
+import json
 from datetime import datetime
 
 # Add the parent directory to path to import mxfp module
@@ -252,8 +253,8 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         'mse_info': mse_info
     }
     results['scale_exponents'] = [scale_exp]
-    
-    # Print current metrics
+        
+        # Print current metrics
     log_func(f"  MSE (original scale, minus_level=0): {mse_info['mse_scale']:.6e}")
     
     # Calculate best MSE from mse_by_minus_level
@@ -278,9 +279,9 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         for ml in sorted(mse_info['mse_by_minus_level'].keys()):
             log_func(f"    minus_level={ml}: {mse_info['mse_by_minus_level'][ml]:.6e}")
     
-    log_func(f"  Final MSE: {metrics['mse']:.6e}, "
-             f"Cosine Sim: {metrics['cosine_similarity']:.6f}, "
-             f"PSNR: {metrics['psnr']:.2f} dB")
+        log_func(f"  Final MSE: {metrics['mse']:.6e}, "
+                 f"Cosine Sim: {metrics['cosine_similarity']:.6f}, "
+                 f"PSNR: {metrics['psnr']:.2f} dB")
     
     return results
 
@@ -1210,6 +1211,147 @@ def save_results_to_file(results, output_path):
     # This will be logged by the caller
     pass
 
+def save_plot_data(results, data_file_path):
+    """
+    Save plot data to JSON file for later reuse.
+    
+    Args:
+        results (dict): Results from test_scaling_levels
+        data_file_path (Path): Path to save the data file
+    """
+    data_file_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Extract plot-relevant data
+    plot_data = {
+        'elem_format': results['elem_format'],
+        'scale_bits': results['scale_bits'],
+        'format_params': results['format_params'],
+        'scale_exponents': results['scale_exponents'],
+        'metrics': {}
+    }
+    
+    # Extract MSE info for plotting
+    for scale_key in results['metrics']:
+        if scale_key in results['metrics']:
+            mse_info = results['metrics'][scale_key].get('mse_info', {})
+            plot_data['metrics'][scale_key] = {
+                'scale_exponent': results['metrics'][scale_key].get('scale_exponent', 0),
+                'mse_info': {
+                    'mse_scale': mse_info.get('mse_scale', 0),
+                    'mse_by_minus_level_simple': {k: float(v) for k, v in mse_info.get('mse_by_minus_level_simple', {}).items()},
+                    'mse_by_minus_level_auto': {k: float(v) for k, v in mse_info.get('mse_by_minus_level_auto', {}).items()},
+                    'best_minus_level': float(mse_info.get('best_minus_level', 0)),
+                    'tested_minus_levels': mse_info.get('tested_minus_levels', [])
+                }
+            }
+    
+    # Convert numpy types to native Python types for JSON
+    def convert_to_json_serializable(obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_to_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_json_serializable(item) for item in obj]
+        return obj
+    
+    plot_data = convert_to_json_serializable(plot_data)
+    
+    with open(data_file_path, 'w', encoding='utf-8') as f:
+        json.dump(plot_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"✅ Plot data saved to: {data_file_path}")
+
+def load_plot_data(data_file_path):
+    """
+    Load plot data from JSON file.
+    
+    Args:
+        data_file_path (Path): Path to the data file
+        
+    Returns:
+        dict: Plot data dictionary, or None if file doesn't exist
+    """
+    if not data_file_path.exists():
+        return None
+    
+    try:
+        with open(data_file_path, 'r', encoding='utf-8') as f:
+            plot_data = json.load(f)
+        print(f"✅ Plot data loaded from: {data_file_path}")
+        return plot_data
+    except Exception as e:
+        print(f"⚠️  Error loading plot data: {e}")
+        return None
+
+def save_aggregated_plot_data(aggregated_results_simple, aggregated_results_auto, 
+                               all_mse_results_simple, all_mse_results_auto, data_file_path):
+    """
+    Save aggregated plot data to JSON file.
+    
+    Args:
+        aggregated_results_simple (dict): Aggregated results for simple method
+        aggregated_results_auto (dict): Aggregated results for auto method
+        all_mse_results_simple (list): Individual MSE results for simple method
+        all_mse_results_auto (list): Individual MSE results for auto method
+        data_file_path (Path): Path to save the data file
+    """
+    data_file_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Convert to JSON-serializable format
+    def convert_dict(d):
+        if isinstance(d, dict):
+            return {str(k): convert_dict(v) for k, v in d.items()}
+        elif isinstance(d, list):
+            return [convert_dict(item) for item in d]
+        elif isinstance(d, (np.integer, np.floating)):
+            return float(d)
+        elif isinstance(d, np.ndarray):
+            return d.tolist()
+        return d
+    
+    plot_data = {
+        'elem_format': aggregated_results_simple['elem_format'],
+        'scale_bits': aggregated_results_simple['scale_bits'],
+        'format_params': aggregated_results_simple['format_params'],
+        'num_tensors': aggregated_results_simple.get('num_tensors', 0),
+        'aggregated_results_simple': convert_dict(aggregated_results_simple),
+        'aggregated_results_auto': convert_dict(aggregated_results_auto),
+        'all_mse_results_simple': convert_dict(all_mse_results_simple),
+        'all_mse_results_auto': convert_dict(all_mse_results_auto)
+    }
+    
+    with open(data_file_path, 'w', encoding='utf-8') as f:
+        json.dump(plot_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"✅ Aggregated plot data saved to: {data_file_path}")
+
+def load_aggregated_plot_data(data_file_path):
+    """
+    Load aggregated plot data from JSON file.
+    
+    Args:
+        data_file_path (Path): Path to the data file
+        
+    Returns:
+        dict: Plot data dictionary, or None if file doesn't exist
+    """
+    if not data_file_path.exists():
+        return None
+    
+    try:
+        with open(data_file_path, 'r', encoding='utf-8') as f:
+            plot_data = json.load(f)
+        print(f"✅ Aggregated plot data loaded from: {data_file_path}")
+        return plot_data
+    except Exception as e:
+        print(f"⚠️  Error loading aggregated plot data: {e}")
+        return None
+
 def remove_scaling(A,elem_format):
     from utils.saver.mxfp_saver import _remove_scaling_mx
     return _remove_scaling_mx(A=A,
@@ -1245,12 +1387,46 @@ def process_single_tensor(input_path, args, logger=None):
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Setup logging for this tensor
+    # Setup data file path
+    data_dir = Path("./draw/input/scaling_analysis")
+    data_dir.mkdir(parents=True, exist_ok=True)
     tensor_name = input_path.stem
+    data_file_path = data_dir / f"{tensor_name}_{args.elem_format}_plot_data.json"
+    
+    # Setup logging for this tensor
     tensor_logger = setup_logging(output_dir, tensor_name, args.elem_format)
     
     tensor_logger.info(f"Loading input tensor: {input_path.name}")
     tensor_logger.info("=" * 60)
+    
+    # Check if plot data exists
+    plot_data = load_plot_data(data_file_path)
+    if plot_data is not None:
+        tensor_logger.info(f"Found existing plot data, skipping computation")
+        tensor_logger.info(f"To recompute, delete: {data_file_path}")
+        
+        # Reconstruct results structure for plotting
+        results = {
+            'elem_format': plot_data['elem_format'],
+            'scale_bits': plot_data['scale_bits'],
+            'format_params': plot_data['format_params'],
+            'scale_exponents': plot_data['scale_exponents'],
+            'metrics': {}
+        }
+        
+        for scale_key, scale_data in plot_data['metrics'].items():
+            results['metrics'][scale_key] = {
+                'scale_exponent': scale_data['scale_exponent'],
+                'mse_info': scale_data['mse_info']
+            }
+        
+        # Generate plots if not disabled
+        if not args.no_plots:
+            plot_mse_by_minus_level(results, output_dir)
+            plot_auto_smax_mse_by_minus_level(results, output_dir)
+            tensor_logger.info(f"Plots saved to: {output_dir}")
+        
+        return 0
     
     # Load input tensor
     try:
@@ -1295,6 +1471,10 @@ def process_single_tensor(input_path, args, logger=None):
     # Save results to file
     save_results_to_file(results, output_dir)
     tensor_logger.info(f"Detailed results saved to: {output_dir}")
+    
+    # Save plot data for future reuse
+    save_plot_data(results, data_file_path)
+    tensor_logger.info(f"Plot data saved to: {data_file_path}")
     
     # Generate MSE by minus_level plots unless disabled
     if not args.no_plots:
@@ -1376,11 +1556,36 @@ def process_folder(input_folder, args):
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Setup data file path
+    data_dir = Path("./draw/input/scaling_analysis")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    data_file_path = data_dir / f"{folder_name}_{args.elem_format}_aggregated_plot_data.json"
+    
     # Setup logging
     folder_logger = setup_logging(output_dir, folder_name, args.elem_format)
     folder_logger.info(f"Processing folder: {input_folder}")
     folder_logger.info(f"Found {len(tensor_files)} tensor files")
     folder_logger.info("=" * 60)
+    
+    # Check if aggregated plot data exists
+    plot_data = load_aggregated_plot_data(data_file_path)
+    if plot_data is not None:
+        folder_logger.info(f"Found existing aggregated plot data, skipping computation")
+        folder_logger.info(f"To recompute, delete: {data_file_path}")
+        
+        # Reconstruct aggregated results structure for plotting
+        aggregated_results_simple = plot_data['aggregated_results_simple']
+        aggregated_results_auto = plot_data['aggregated_results_auto']
+        all_mse_results_simple = plot_data['all_mse_results_simple']
+        all_mse_results_auto = plot_data['all_mse_results_auto']
+        
+        # Generate aggregated plots if not disabled
+        if not args.no_plots:
+            plot_aggregated_mse_by_minus_level(aggregated_results_simple, output_dir, all_mse_results_simple)
+            plot_aggregated_auto_smax_mse_by_minus_level(aggregated_results_auto, output_dir, all_mse_results_auto)
+            folder_logger.info(f"Aggregated plots saved to: {output_dir}")
+        
+        return 0
     
     # Collect all MSE results for both methods
     all_mse_results_simple = []  # List of {minus_level: mse} dicts for simple method
@@ -1553,6 +1758,11 @@ def process_folder(input_folder, args):
         'num_tensors': successful_count
     }
     
+    # Save aggregated plot data for future reuse
+    save_aggregated_plot_data(aggregated_results_simple, aggregated_results_auto,
+                              all_mse_results_simple, all_mse_results_auto, data_file_path)
+    folder_logger.info(f"Aggregated plot data saved to: {data_file_path}")
+    
     # Generate aggregated plots for both methods
     if not args.no_plots:
         plot_aggregated_mse_by_minus_level(aggregated_results_simple, output_dir, all_mse_results_simple)
@@ -1627,10 +1837,13 @@ def plot_aggregated_mse_by_minus_level(aggregated_results, output_path, all_mse_
     std_data = mse_info.get('mse_std_by_minus_level', {})
     minus_level_std[0] = std_data.get(0, 0)
     
-    # Add other minus_levels
-    for minus_level, mse in mse_info['mse_by_minus_level_simple'].items():
+    # Add other minus_levels - convert keys to int (JSON loads them as strings)
+    for minus_level_key, mse in mse_info['mse_by_minus_level_simple'].items():
+        minus_level = int(minus_level_key) if isinstance(minus_level_key, str) else int(minus_level_key)
         minus_level_mse[minus_level] = mse
-        minus_level_std[minus_level] = std_data.get(minus_level, 0)
+        # Also check std_data with both string and int keys
+        std_key = minus_level_key if minus_level_key in std_data else minus_level
+        minus_level_std[minus_level] = std_data.get(std_key, 0)
     
     if not minus_level_mse:
         return
@@ -1639,7 +1852,7 @@ def plot_aggregated_mse_by_minus_level(aggregated_results, output_path, all_mse_
     format_params = aggregated_results.get('format_params', {})
     num_tensors = aggregated_results.get('num_tensors', 0)
     
-    # Sort minus_levels
+    # Sort minus_levels (now all are int)
     minus_levels = sorted(minus_level_mse.keys())
     mse_values = [minus_level_mse[ml] for ml in minus_levels]
     std_values = [minus_level_std.get(ml, 0) for ml in minus_levels]
@@ -1802,10 +2015,13 @@ def plot_aggregated_auto_smax_mse_by_minus_level(aggregated_results, output_path
     std_data = mse_info.get('mse_std_by_minus_level', {})
     minus_level_std[0] = std_data.get(0, 0)
     
-    # Add other minus_levels
-    for minus_level, mse in mse_info['mse_by_minus_level_auto'].items():
+    # Add other minus_levels - convert keys to int (JSON loads them as strings)
+    for minus_level_key, mse in mse_info['mse_by_minus_level_auto'].items():
+        minus_level = int(minus_level_key) if isinstance(minus_level_key, str) else int(minus_level_key)
         minus_level_mse[minus_level] = mse
-        minus_level_std[minus_level] = std_data.get(minus_level, 0)
+        # Also check std_data with both string and int keys
+        std_key = minus_level_key if minus_level_key in std_data else minus_level
+        minus_level_std[minus_level] = std_data.get(std_key, 0)
     
     if not minus_level_mse:
         return
@@ -1814,7 +2030,7 @@ def plot_aggregated_auto_smax_mse_by_minus_level(aggregated_results, output_path
     format_params = aggregated_results.get('format_params', {})
     num_tensors = aggregated_results.get('num_tensors', 0)
     
-    # Sort minus_levels
+    # Sort minus_levels (now all are int)
     minus_levels = sorted(minus_level_mse.keys())
     mse_values = [minus_level_mse[ml] for ml in minus_levels]
     std_values = [minus_level_std.get(ml, 0) for ml in minus_levels]
