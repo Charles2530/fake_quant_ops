@@ -1292,6 +1292,7 @@ def load_value_distribution_data(data_file_path):
     Returns:
         dict: Plot data dictionary, or None if file doesn't exist
     """
+    import pdb;pdb.set_trace()
     if not data_file_path.exists():
         return None
     
