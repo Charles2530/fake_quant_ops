@@ -1292,7 +1292,6 @@ def load_value_distribution_data(data_file_path):
     Returns:
         dict: Plot data dictionary, or None if file doesn't exist
     """
-    import pdb;pdb.set_trace()
     if not data_file_path.exists():
         return None
     
@@ -1443,7 +1442,9 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
             
             print(f"\n✅ Plot saved to: {plot_path}")
         
-        return plot_data
+        # 即使从缓存加载，也需要重新处理tensor进行zeroing loss分析
+        # 所以不在这里返回，继续执行zeroing loss分析
+        all_results = plot_data
     
     # Process each minus_exp value
     all_results = {}
@@ -1611,8 +1612,261 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
                   f"(total count: {stats['count']:,})")
         print("=" * 60)
     
-    # Save plot data for future reuse
-    save_value_distribution_data(all_results, data_file_path)
+    # Save plot data for future reuse (only if not loaded from cache)
+    if plot_data is None:  # Only save if we computed new data
+        save_value_distribution_data(all_results, data_file_path)
+    
+    # ========== 新增功能：分析 zeroing loss 占比最大的情况 ==========
+    print("\n" + "=" * 60)
+    print("ANALYZING ZEROING LOSS (4,5,6比例最小的情况)")
+    print("=" * 60)
+    
+    # 收集所有tensor的0和4、5、6比例数据
+    zeroing_analysis_data = []
+    
+    for minus_exp in minus_exp_list:
+        print(f"\nProcessing minus_exp = {minus_exp} for zeroing loss analysis...")
+        
+        # 重新处理每个tensor以获取详细统计
+        for i, tensor_file in enumerate(tensor_files, 1):
+            try:
+                # Load tensor
+                data = torch.load(str(tensor_file), map_location='cpu', weights_only=False)
+                
+                if isinstance(data, dict) and 'tensor' in data:
+                    input_tensor = data['tensor']
+                elif isinstance(data, torch.Tensor):
+                    input_tensor = data
+                else:
+                    continue
+                
+                # Convert to bfloat16 if needed
+                if input_tensor.dtype != torch.bfloat16:
+                    input_tensor = input_tensor.bfloat16()
+                
+                # Quantize and get statistics
+                quantized_tensor, distribution = _quantize_mx_with_statistics(
+                    input_tensor,
+                    scale_bits=scale_bits,
+                    elem_format=elem_format,
+                    shared_exp_method="max",
+                    axes=axes,
+                    block_size=block_size,
+                    minus_exp=minus_exp,
+                    round="nearest",
+                    flush_fp32_subnorms=False,
+                    scaling_control="max",
+                    target_values=target_values
+                )
+                
+                if not distribution:
+                    continue
+                
+                # 计算0的比例
+                zero_percent = distribution.get(0.0, {}).get('percent', 0.0)
+                
+                # 计算4、5、6的比例（包括正负值）
+                # 注意：5可能不在target_values中，所以只统计存在的值
+                large_values = [4.0, 5.0, 6.0]
+                large_percent = 0.0
+                for val in large_values:
+                    # 只统计在distribution中存在的值
+                    if val in distribution:
+                        large_percent += distribution[val].get('percent', 0.0)
+                    if -val in distribution:
+                        large_percent += distribution[-val].get('percent', 0.0)
+                
+                zeroing_analysis_data.append({
+                    'tensor_file': tensor_file.name,
+                    'minus_exp': minus_exp,
+                    'zero_percent': zero_percent,
+                    'large_percent': large_percent,  # 4,5,6的总比例
+                    'distribution': distribution,
+                    'quantized_tensor': quantized_tensor
+                })
+                
+            except Exception as e:
+                continue
+    
+    if not zeroing_analysis_data:
+        print("No data collected for zeroing loss analysis.")
+        return all_results
+    
+    # 找出4、5、6比例最小的tensor（即zeroing loss占比最大）
+    min_large_percent_idx = np.argmin([d['large_percent'] for d in zeroing_analysis_data])
+    max_zeroing_loss_data = zeroing_analysis_data[min_large_percent_idx]
+    
+    print(f"\n找到 zeroing loss 占比最大的 tensor:")
+    print(f"  Tensor: {max_zeroing_loss_data['tensor_file']}")
+    print(f"  minus_exp: {max_zeroing_loss_data['minus_exp']}")
+    print(f"  0的比例: {max_zeroing_loss_data['zero_percent']:.2f}%")
+    print(f"  4,5,6的比例: {max_zeroing_loss_data['large_percent']:.2f}%")
+    
+    # 绘制zeroing loss占比最大的tensor的分布图
+    distribution = max_zeroing_loss_data['distribution']
+    sorted_values = sorted(distribution.keys())
+    percentages = [distribution[v]['percent'] for v in sorted_values]
+    labels = [f'{v:+.1f}' if v != 0 else '0' for v in sorted_values]
+    
+    try:
+        plt.style.use('seaborn-v0_8-darkgrid')
+    except:
+        try:
+            plt.style.use('seaborn-darkgrid')
+        except:
+            plt.style.use('default')
+    
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    # Use gradient colors
+    colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(sorted_values)))
+    
+    # Create bar plot
+    bars = ax.bar(range(len(sorted_values)), percentages, 
+                  color=colors, alpha=0.8, edgecolor='white', linewidth=2)
+    
+    # Add value labels on bars
+    for i, (bar, pct) in enumerate(zip(bars, percentages)):
+        height = bar.get_height()
+        if height > 0.5:  # Only show label if bar is significant
+            ax.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                    f'{pct:.2f}%',
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    # Highlight 0 and 4,5,6 bars
+    for i, val in enumerate(sorted_values):
+        abs_val = abs(float(val))
+        if abs_val < 1e-6:  # Zero
+            bars[i].set_color('#FF6B6B')  # Red for zero
+            bars[i].set_edgecolor('black')
+            bars[i].set_linewidth(2.5)
+        elif abs_val in [4.0, 5.0, 6.0]:
+            bars[i].set_color('#4A90E2')  # Blue for large values
+            bars[i].set_edgecolor('black')
+            bars[i].set_linewidth(2.5)
+    
+    # Styling
+    ax.set_xlabel('Quantized Values', fontsize=14, fontweight='bold', color='#333333')
+    ax.set_ylabel('Percentage (%)', fontsize=14, fontweight='bold', color='#333333')
+    ax.set_xticks(range(len(sorted_values)))
+    ax.set_xticklabels(labels, fontsize=12, fontweight='bold')
+    ax.set_title(f'Zeroing Loss Analysis - Maximum Zeroing Loss Case\n'
+                 f'{elem_format.upper()} | minus_exp={max_zeroing_loss_data["minus_exp"]} | '
+                 f'Tensor: {max_zeroing_loss_data["tensor_file"]}\n'
+                 f'Zero: {max_zeroing_loss_data["zero_percent"]:.2f}% | '
+                 f'Large (4,5,6): {max_zeroing_loss_data["large_percent"]:.2f}%',
+                 fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
+    
+    # Grid
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.7, color='#CCCCCC', axis='y')
+    ax.set_axisbelow(True)
+    
+    # Background
+    ax.set_facecolor('#F8F9FA')
+    fig.patch.set_facecolor('white')
+    
+    # Border
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#E0E0E0')
+        spine.set_linewidth(1.5)
+    
+    plt.tight_layout()
+    
+    # Save plot
+    zeroing_plot_path = output_dir / f'zeroing_loss_max_{elem_format}_{folder_path.name}.pdf'
+    plt.savefig(zeroing_plot_path, 
+               format='pdf',
+               dpi=600,
+               bbox_inches='tight',
+               facecolor='white',
+               edgecolor='none',
+               metadata={'Creator': 'MXFP Formatter', 
+                        'Title': f'Zeroing Loss Analysis - Maximum Case - {elem_format}'})
+    plt.close()
+    
+    print(f"\n✅ Zeroing loss plot saved to: {zeroing_plot_path}")
+    
+    # 统计0和4、5、6比例的比较
+    print("\n" + "=" * 60)
+    print("STATISTICS: Zero vs Large Values (4,5,6) Comparison")
+    print("=" * 60)
+    
+    zero_percents = [d['zero_percent'] for d in zeroing_analysis_data]
+    large_percents = [d['large_percent'] for d in zeroing_analysis_data]
+    
+    # 统计0比较多的情况
+    zero_dominant_count = sum(1 for z, l in zip(zero_percents, large_percents) if z > l)
+    zero_dominant_percent = (zero_dominant_count / len(zeroing_analysis_data)) * 100
+    
+    print(f"Total tensors analyzed: {len(zeroing_analysis_data)}")
+    print(f"\nZero percentage statistics:")
+    print(f"  Mean: {np.mean(zero_percents):.2f}%")
+    print(f"  Std:  {np.std(zero_percents):.2f}%")
+    print(f"  Min:  {np.min(zero_percents):.2f}%")
+    print(f"  Max:  {np.max(zero_percents):.2f}%")
+    
+    print(f"\nLarge values (4,5,6) percentage statistics:")
+    print(f"  Mean: {np.mean(large_percents):.2f}%")
+    print(f"  Std:  {np.std(large_percents):.2f}%")
+    print(f"  Min:  {np.min(large_percents):.2f}%")
+    print(f"  Max:  {np.max(large_percents):.2f}%")
+    
+    print(f"\nZero > Large (4,5,6) cases: {zero_dominant_count}/{len(zeroing_analysis_data)} ({zero_dominant_percent:.2f}%)")
+    
+    # 绘制0和4、5、6比例的对比散点图
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Scatter plot
+    scatter = ax.scatter(zero_percents, large_percents, 
+                        alpha=0.6, s=100, c=range(len(zero_percents)), 
+                        cmap='viridis', edgecolors='black', linewidths=0.5)
+    
+    # Highlight the max zeroing loss case
+    ax.scatter([max_zeroing_loss_data['zero_percent']], 
+               [max_zeroing_loss_data['large_percent']],
+               s=300, c='red', marker='*', edgecolors='black', 
+               linewidths=2, label='Max Zeroing Loss', zorder=5)
+    
+    # Add diagonal line (zero = large)
+    max_val = max(max(zero_percents), max(large_percents))
+    ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, linewidth=1, label='Zero = Large')
+    
+    # Styling
+    ax.set_xlabel('Zero Percentage (%)', fontsize=14, fontweight='bold', color='#333333')
+    ax.set_ylabel('Large Values (4,5,6) Percentage (%)', fontsize=14, fontweight='bold', color='#333333')
+    ax.set_title(f'Zero vs Large Values Comparison\n'
+                 f'{elem_format.upper()} | {len(zeroing_analysis_data)} tensors',
+                 fontsize=16, fontweight='bold', pad=20, color='#2C3E50')
+    
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.7, color='#CCCCCC')
+    ax.set_axisbelow(True)
+    ax.legend(fontsize=12, loc='upper right')
+    
+    # Background
+    ax.set_facecolor('#F8F9FA')
+    fig.patch.set_facecolor('white')
+    
+    # Border
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#E0E0E0')
+        spine.set_linewidth(1.5)
+    
+    plt.tight_layout()
+    
+    # Save comparison plot
+    comparison_plot_path = output_dir / f'zero_vs_large_comparison_{elem_format}_{folder_path.name}.pdf'
+    plt.savefig(comparison_plot_path, 
+               format='pdf',
+               dpi=600,
+               bbox_inches='tight',
+               facecolor='white',
+               edgecolor='none',
+               metadata={'Creator': 'MXFP Formatter', 
+                        'Title': f'Zero vs Large Values Comparison - {elem_format}'})
+    plt.close()
+    
+    print(f"\n✅ Comparison plot saved to: {comparison_plot_path}")
+    print("=" * 60)
     
     return all_results
 
@@ -1620,8 +1874,24 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
 if __name__ == '__main__':
     import argparse
     
-    parser = argparse.ArgumentParser(description='Analyze value distribution for fp4_e2m1 quantization')
+    parser = argparse.ArgumentParser(
+        description='Analyze value distribution for fp4_e2m1 quantization',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Test all default minus_exp values (0, 1, 2)
+  python utils/saver/mxfp_formater.py data/bf16
+  
+  # Test only minus_exp=0
+  python utils/saver/mxfp_formater.py data/bf16 0
+  
+  # Test multiple minus_exp values using --minus-exp-list
+  python utils/saver/mxfp_formater.py data/bf16 --minus-exp-list 0 1 2 3
+        '''
+    )
     parser.add_argument('folder_path', type=str, help='Path to folder containing .pt tensor files')
+    parser.add_argument('minus_exp', type=int, nargs='?', default=None,
+                        help='Single minus_exp value to test (optional). If provided, overrides --minus-exp-list. Example: python utils/saver/mxfp_formater.py data/bf16 0')
     parser.add_argument('--elem-format', default='fp4_e2m1', 
                         choices=['fp4_e2m1', 'fp8_e4m3', 'fp8_e5m2'],
                         help='Element format (default: fp4_e2m1)')
@@ -1634,9 +1904,17 @@ if __name__ == '__main__':
     parser.add_argument('--axes', type=int, default=-1,
                         help='Axes for shared exponent calculation (default: -1)')
     parser.add_argument('--minus-exp-list', type=int, nargs='+', default=[0, 1, 2],
-                        help='List of minus_exp values to test (default: 0 1 2)')
+                        help='List of minus_exp values to test (default: 0 1 2). Ignored if minus_exp positional argument is provided.')
     
     args = parser.parse_args()
+    
+    # If minus_exp positional argument is provided, use it instead of --minus-exp-list
+    if args.minus_exp is not None:
+        minus_exp_list = [args.minus_exp]
+        print(f"Using single minus_exp value: {args.minus_exp}")
+    else:
+        minus_exp_list = args.minus_exp_list
+        print(f"Using minus_exp_list: {minus_exp_list}")
     
     # Default target values for fp4_e2m1
     target_values = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
@@ -1649,5 +1927,5 @@ if __name__ == '__main__':
         scale_bits=args.scale_bits,
         block_size=args.block_size,
         axes=args.axes,
-        minus_exp_list=args.minus_exp_list
+        minus_exp_list=minus_exp_list
     )
