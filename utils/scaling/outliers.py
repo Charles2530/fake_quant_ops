@@ -109,8 +109,6 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
                             num_sigma*=4
                         elif num_sigma < 10:
                             num_sigma*=2
-                        elif num_sigma > 80:
-                            num_sigma/=4
                         elif num_sigma > 40:
                             num_sigma/=2
                         num_sigma_list.append(num_sigma / 2)
