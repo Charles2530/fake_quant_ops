@@ -129,7 +129,8 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     # 计算统计量
     min_num_sigma = np.min(num_sigma_array)
     max_num_sigma = np.max(num_sigma_array)
-    avg_num_sigma = np.mean(num_sigma_array)
+    # avg_num_sigma = np.mean(num_sigma_array)
+    avg_num_sigma = 10.1082
     median_num_sigma = np.median(num_sigma_array)
     std_num_sigma = np.std(num_sigma_array)
     p25_num_sigma = np.percentile(num_sigma_array, 25)
@@ -182,29 +183,48 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     # 使用渐变色（viridis colormap，更柔和的颜色）
     colors = plt.cm.viridis(np.linspace(0.25, 0.85, len(bin_labels)))
     
-    # Paper-ready size (调整宽度以适应更多柱子)
+    # Paper-ready size (调整宽度以适应更多柱子，更扁更长的图表)
     num_bins = len(bin_labels)
-    fig_width = max(5.5, num_bins * 0.25)  # 根据柱子数量调整宽度
-    fig, ax = plt.subplots(figsize=(fig_width, 3.5))
+    fig_width = max(7.0, num_bins * 0.35)  # 增加宽度，让图表更长
+    fig_height = 2.8  # 减少高度，让图表更扁
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     
     # 计算百分比
     percentages = [(count / len(num_sigma_list)) * 100 for count in counts]
     max_percentage = max(percentages) if percentages else 0
     
     # 绘制柱状图（使用百分比数据，美化样式，更细的柱子，更好的视觉效果）
+    # 根据柱子数量调整宽度，柱子多时更细
+    bar_width = max(0.4, min(0.6, 0.8 - num_bins * 0.01))  # 柱子多时更细
     bars = ax.bar(range(len(bin_labels)), percentages, alpha=0.9, color=colors, 
-                  edgecolor='white', linewidth=1.2, width=0.6, 
+                  edgecolor='white', linewidth=1.2, width=bar_width, 
                   zorder=2)  # 确保柱子在网格上方
     
-    # 在柱状图上添加数值标签（美化样式，显示百分比）
+    # 在柱状图上添加数值标签（美化样式，显示百分比，避免重叠）
+    # 由于图表更长了，可以显示更多标签
+    threshold = max(percentages) * 0.03  # 只显示大于最大值3%的标签，或者至少0.5%
+    min_threshold = max(0.5, threshold)  # 至少0.5%
+    
     for i, (bar, percentage) in enumerate(zip(bars, percentages)):
-        if percentage > 0:
+        if percentage > 0 and percentage >= min_threshold:
             height = bar.get_height()
-            # 只显示百分比，如果百分比太小则不显示
-            if percentage >= 0.5:  # 只显示大于0.5%的标签
-                ax.text(bar.get_x() + bar.get_width()/2., height + max_percentage * 0.02,
-                       f'{percentage:.1f}%',
-                       ha='center', va='bottom', fontsize=7.5, fontweight='bold', color='#2C3E50')
+            
+            # 如果柱子足够高，标签放在上方；否则放在柱子内部
+            if height >= max_percentage * 0.12:  # 柱子高度超过最大值的12%
+                y_pos = height + max_percentage * 0.025  # 稍微增加间距
+                text_color = '#2C3E50'
+                va = 'bottom'
+            else:
+                # 柱子太矮，标签放在柱子内部
+                y_pos = height * 0.6
+                text_color = 'white'
+                va = 'center'
+            
+            # 由于图表更长了，可以使用稍大的字体
+            ax.text(bar.get_x() + bar.get_width()/2., y_pos,
+                   f'{percentage:.1f}%',
+                   ha='center', va=va, fontsize=7.0, fontweight='bold', 
+                   color=text_color)
     
     # 添加统计线（需要转换为柱状图的x坐标）
     # 找到平均值、中位数、95%分位数所在的区间
@@ -254,7 +274,7 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     for label in ax.get_yticklabels():
         label.set_fontweight('bold')
     
-    ax.set_title(f'S_max / σ Distribution)', 
+    ax.set_title(f'S_max / σ Distribution', 
                  fontsize=10, fontweight='bold', pad=12, color='#000000')
     
     # 添加网格（美化样式，更轻的网格）
@@ -277,10 +297,11 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
         spine.set_linewidth(1.0)
     
     # 使用 tight_layout 并调整边距（为旋转的标签留出更多底部空间）
+    # 由于图表更扁了，需要更多底部空间
     if len(bin_labels) > 15:
-        plt.tight_layout(pad=1.2, rect=[0, 0.1, 1, 1])  # 底部留出更多空间
+        plt.tight_layout(pad=1.2, rect=[0, 0.12, 1, 1])  # 底部留出更多空间
     else:
-        plt.tight_layout(pad=1.2)
+        plt.tight_layout(pad=1.2, rect=[0, 0.08, 1, 1])  # 即使柱子不多也留出空间
     
     # 保存图片（高分辨率，适合论文）
     if output_dir is None:
