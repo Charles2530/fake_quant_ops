@@ -1304,13 +1304,89 @@ def load_value_distribution_data(data_file_path):
         print(f"⚠️  Error loading value distribution data: {e}")
         return None
 
+def _process_single_tensor(tensor_file, minus_exp, elem_format, scale_bits, block_size, 
+                          axes, target_values, return_quantized=False):
+    """
+    Process a single tensor file and return distribution statistics.
+    
+    Args:
+        tensor_file: Path to tensor file
+        minus_exp: minus_exp value to use
+        elem_format: Element format
+        scale_bits: Number of scale bits
+        block_size: Block size for tiling
+        axes: Axes for shared exponent calculation
+        target_values: List of target values to analyze
+        return_quantized: If True, also return quantized tensor
+        
+    Returns:
+        dict: Result dictionary with 'success', 'distribution', 'tensor_file', 'error', etc.
+    """
+    result = {
+        'success': False,
+        'tensor_file': str(tensor_file),
+        'tensor_name': tensor_file.name if hasattr(tensor_file, 'name') else str(tensor_file),
+        'minus_exp': minus_exp,
+        'distribution': None,
+        'quantized_tensor': None,
+        'error': None
+    }
+    
+    try:
+        # Load tensor
+        data = torch.load(str(tensor_file), map_location='cpu', weights_only=False)
+        
+        if isinstance(data, dict) and 'tensor' in data:
+            input_tensor = data['tensor']
+        elif isinstance(data, torch.Tensor):
+            input_tensor = data
+        else:
+            result['error'] = 'Invalid format'
+            return result
+        
+        # Convert to bfloat16 if needed
+        if input_tensor.dtype != torch.bfloat16:
+            input_tensor = input_tensor.bfloat16()
+        
+        # Quantize and get statistics
+        quantized_tensor, distribution = _quantize_mx_with_statistics(
+            input_tensor,
+            scale_bits=scale_bits,
+            elem_format=elem_format,
+            shared_exp_method="max",
+            axes=axes,
+            block_size=block_size,
+            minus_exp=minus_exp,
+            round="nearest",
+            flush_fp32_subnorms=False,
+            scaling_control="max",
+            target_values=target_values
+        )
+        
+        if distribution:
+            result['success'] = True
+            result['distribution'] = distribution
+            if return_quantized:
+                result['quantized_tensor'] = quantized_tensor
+        else:
+            result['error'] = 'No distribution data'
+            
+    except Exception as e:
+        result['error'] = str(e)
+        import traceback
+        result['traceback'] = traceback.format_exc()
+    
+    return result
+
+
 def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1', 
                                       target_values=[0, 0.5, 1, 1.5, 2, 3, 4, 6],
                                       output_dir=None, scale_bits=8, block_size=32, axes=-1,
-                                      minus_exp_list=[0, 1, 2]):
+                                      minus_exp_list=[0, 1, 2], num_workers=4):
     """
     Analyze value distribution for all tensor files in a folder.
     Supports multiple minus_exp values and generates separate plots for each.
+    Uses multithreading to speed up processing.
     
     Args:
         folder_path (str): Path to folder containing .pt tensor files
@@ -1321,11 +1397,40 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
         block_size (int): Block size for tiling
         axes (int): Axes for shared exponent calculation
         minus_exp_list (list): List of minus_exp values to test (default: [0, 1, 2])
+        num_workers (int): Number of worker threads for parallel processing (default: 4)
     """
     import matplotlib.pyplot as plt
     import numpy as np
     from pathlib import Path
     import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    # Try to import tqdm for progress bar, fallback to simple print if not available
+    try:
+        from tqdm import tqdm
+        HAS_TQDM = True
+    except ImportError:
+        HAS_TQDM = False
+        # Simple tqdm replacement
+        class tqdm:
+            def __init__(self, total=None, desc=None, unit=None):
+                self.total = total
+                self.desc = desc or ""
+                self.unit = unit or ""
+                self.n = 0
+                self.postfix = {}
+            def update(self, n=1):
+                self.n += n
+                if self.total:
+                    print(f"{self.desc}: {self.n}/{self.total} {self.unit}")
+                else:
+                    print(f"{self.desc}: {self.n} {self.unit}")
+            def set_postfix(self, **kwargs):
+                self.postfix = kwargs
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
     
     folder_path = Path(folder_path)
     if not folder_path.exists() or not folder_path.is_dir():
@@ -1454,56 +1559,43 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
         print(f"Processing minus_exp = {minus_exp}")
         print(f"{'='*60}")
         
-        # Collect statistics from all tensors for this minus_exp
+        # Collect statistics from all tensors for this minus_exp using multithreading
         all_distributions = []
         successful_count = 0
         
-        for i, tensor_file in enumerate(tensor_files, 1):
-            print(f"[{i}/{len(tensor_files)}] Processing: {tensor_file.name}")
+        print(f"Processing {len(tensor_files)} tensors with {num_workers} workers...")
+        
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_tensor = {
+                executor.submit(
+                    _process_single_tensor,
+                    tensor_file, minus_exp, elem_format, scale_bits,
+                    block_size, axes, target_values, return_quantized=False
+                ): tensor_file
+                for tensor_file in tensor_files
+            }
             
-            try:
-                # Load tensor
-                data = torch.load(str(tensor_file), map_location='cpu', weights_only=False)
-                
-                if isinstance(data, dict) and 'tensor' in data:
-                    input_tensor = data['tensor']
-                elif isinstance(data, torch.Tensor):
-                    input_tensor = data
-                else:
-                    print(f"  ⚠️  Skipping {tensor_file.name}: Invalid format")
-                    continue
-                
-                # Convert to bfloat16 if needed
-                if input_tensor.dtype != torch.bfloat16:
-                    input_tensor = input_tensor.bfloat16()
-                
-                # Quantize and get statistics
-                quantized_tensor, distribution = _quantize_mx_with_statistics(
-                    input_tensor,
-                    scale_bits=scale_bits,
-                    elem_format=elem_format,
-                    shared_exp_method="max",
-                    axes=axes,
-                    block_size=block_size,
-                    minus_exp=minus_exp,
-                    round="nearest",
-                    flush_fp32_subnorms=False,
-                    scaling_control="max",
-                    target_values=target_values
-                )
-                
-                if distribution:
-                    all_distributions.append(distribution)
-                    successful_count += 1
-                    print(f"  ✅ Processed: {tensor_file.name}")
-                else:
-                    print(f"  ⚠️  No distribution data for {tensor_file.name}")
+            # Process completed tasks with progress bar
+            with tqdm(total=len(tensor_files), desc=f"minus_exp={minus_exp}", 
+                     unit="tensor") as pbar:
+                for future in as_completed(future_to_tensor):
+                    tensor_file = future_to_tensor[future]
+                    result = future.result()
                     
-            except Exception as e:
-                print(f"  ❌ Error processing {tensor_file.name}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                continue
+                    if result['success']:
+                        all_distributions.append(result['distribution'])
+                        successful_count += 1
+                        pbar.set_postfix({'success': successful_count, 
+                                        'file': result['tensor_name'][:30]})
+                    else:
+                        if result['error']:
+                            print(f"  ⚠️  {result['tensor_name']}: {result['error']}")
+                        if 'traceback' in result:
+                            print(f"  ❌ Error in {result['tensor_name']}:")
+                            print(result['traceback'])
+                    
+                    pbar.update(1)
         
         if not all_distributions:
             print(f"No valid distribution data collected for minus_exp={minus_exp}.")
@@ -1627,66 +1719,49 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
     for minus_exp in minus_exp_list:
         print(f"\nProcessing minus_exp = {minus_exp} for zeroing loss analysis...")
         
-        # 重新处理每个tensor以获取详细统计
-        for i, tensor_file in enumerate(tensor_files, 1):
-            try:
-                # Load tensor
-                data = torch.load(str(tensor_file), map_location='cpu', weights_only=False)
-                
-                if isinstance(data, dict) and 'tensor' in data:
-                    input_tensor = data['tensor']
-                elif isinstance(data, torch.Tensor):
-                    input_tensor = data
-                else:
-                    continue
-                
-                # Convert to bfloat16 if needed
-                if input_tensor.dtype != torch.bfloat16:
-                    input_tensor = input_tensor.bfloat16()
-                
-                # Quantize and get statistics
-                quantized_tensor, distribution = _quantize_mx_with_statistics(
-                    input_tensor,
-                    scale_bits=scale_bits,
-                    elem_format=elem_format,
-                    shared_exp_method="max",
-                    axes=axes,
-                    block_size=block_size,
-                    minus_exp=minus_exp,
-                    round="nearest",
-                    flush_fp32_subnorms=False,
-                    scaling_control="max",
-                    target_values=target_values
-                )
-                
-                if not distribution:
-                    continue
-                
-                # 计算0的比例
-                zero_percent = distribution.get(0.0, {}).get('percent', 0.0)
-                
-                # 计算4、5、6的比例（包括正负值）
-                # 注意：5可能不在target_values中，所以只统计存在的值
-                large_values = [4.0, 5.0, 6.0]
-                large_percent = 0.0
-                for val in large_values:
-                    # 只统计在distribution中存在的值
-                    if val in distribution:
-                        large_percent += distribution[val].get('percent', 0.0)
-                    if -val in distribution:
-                        large_percent += distribution[-val].get('percent', 0.0)
-                
-                zeroing_analysis_data.append({
-                    'tensor_file': tensor_file.name,
-                    'minus_exp': minus_exp,
-                    'zero_percent': zero_percent,
-                    'large_percent': large_percent,  # 4,5,6的总比例
-                    'distribution': distribution,
-                    'quantized_tensor': quantized_tensor
-                })
-                
-            except Exception as e:
-                continue
+        # 使用多线程重新处理每个tensor以获取详细统计
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            future_to_tensor = {
+                executor.submit(
+                    _process_single_tensor,
+                    tensor_file, minus_exp, elem_format, scale_bits,
+                    block_size, axes, target_values, return_quantized=True
+                ): tensor_file
+                for tensor_file in tensor_files
+            }
+            
+            with tqdm(total=len(tensor_files), desc=f"zeroing_loss minus_exp={minus_exp}", 
+                     unit="tensor") as pbar:
+                for future in as_completed(future_to_tensor):
+                    result = future.result()
+                    
+                    if result['success'] and result['distribution']:
+                        distribution = result['distribution']
+                        
+                        # 计算0的比例
+                        zero_percent = distribution.get(0.0, {}).get('percent', 0.0)
+                        
+                        # 计算4、5、6的比例（包括正负值）
+                        # 注意：5可能不在target_values中，所以只统计存在的值
+                        large_values = [4.0, 5.0, 6.0]
+                        large_percent = 0.0
+                        for val in large_values:
+                            # 只统计在distribution中存在的值
+                            if val in distribution:
+                                large_percent += distribution[val].get('percent', 0.0)
+                            if -val in distribution:
+                                large_percent += distribution[-val].get('percent', 0.0)
+                        
+                        zeroing_analysis_data.append({
+                            'tensor_file': result['tensor_name'],
+                            'minus_exp': minus_exp,
+                            'zero_percent': zero_percent,
+                            'large_percent': large_percent,  # 4,5,6的总比例
+                            'distribution': distribution,
+                            'quantized_tensor': result['quantized_tensor']
+                        })
+                    
+                    pbar.update(1)
     
     if not zeroing_analysis_data:
         print("No data collected for zeroing loss analysis.")
@@ -1905,6 +1980,8 @@ Examples:
                         help='Axes for shared exponent calculation (default: -1)')
     parser.add_argument('--minus-exp-list', type=int, nargs='+', default=[0, 1, 2],
                         help='List of minus_exp values to test (default: 0 1 2). Ignored if minus_exp positional argument is provided.')
+    parser.add_argument('--num-workers', type=int, default=64,
+                        help='Number of worker threads for parallel processing (default: 4)')
     
     args = parser.parse_args()
     
@@ -1927,5 +2004,6 @@ Examples:
         scale_bits=args.scale_bits,
         block_size=args.block_size,
         axes=args.axes,
-        minus_exp_list=minus_exp_list
+        minus_exp_list=minus_exp_list,
+        num_workers=args.num_workers
     )
