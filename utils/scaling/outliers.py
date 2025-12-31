@@ -131,7 +131,7 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     # 计算统计量
     min_num_sigma = np.min(num_sigma_array)
     max_num_sigma = np.max(num_sigma_array)
-    avg_num_sigma = 10.1082
+    avg_num_sigma = np.mean(num_sigma_array)
     median_num_sigma = np.median(num_sigma_array)
     std_num_sigma = np.std(num_sigma_array)
     p25_num_sigma = np.percentile(num_sigma_array, 25)
@@ -181,26 +181,32 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     # 按区间统计频数
     counts, bin_edges = np.histogram(num_sigma_array, bins=bins)
     
-    # 使用渐变色（viridis colormap）
-    colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(bin_labels)))
+    # 使用渐变色（viridis colormap，更柔和的颜色）
+    colors = plt.cm.viridis(np.linspace(0.25, 0.85, len(bin_labels)))
     
     # Paper-ready size (调整宽度以适应更多柱子)
     num_bins = len(bin_labels)
     fig_width = max(5.5, num_bins * 0.25)  # 根据柱子数量调整宽度
     fig, ax = plt.subplots(figsize=(fig_width, 3.5))
     
-    # 绘制柱状图（美化样式，更细的柱子）
-    bars = ax.bar(range(len(bin_labels)), counts, alpha=0.85, color=colors, 
-                  edgecolor='white', linewidth=1.0, width=0.6)
+    # 计算百分比
+    percentages = [(count / len(num_sigma_list)) * 100 for count in counts]
+    max_percentage = max(percentages) if percentages else 0
     
-    # 在柱状图上添加数值标签（美化样式）
-    for i, (bar, count) in enumerate(zip(bars, counts)):
-        if count > 0:
+    # 绘制柱状图（使用百分比数据，美化样式，更细的柱子，更好的视觉效果）
+    bars = ax.bar(range(len(bin_labels)), percentages, alpha=0.9, color=colors, 
+                  edgecolor='white', linewidth=1.2, width=0.6, 
+                  zorder=2)  # 确保柱子在网格上方
+    
+    # 在柱状图上添加数值标签（美化样式，显示百分比）
+    for i, (bar, percentage) in enumerate(zip(bars, percentages)):
+        if percentage > 0:
             height = bar.get_height()
-            # 只显示数值，简洁明了
-            ax.text(bar.get_x() + bar.get_width()/2., height + max(counts) * 0.01,
-                   f'{int(count)}',
-                   ha='center', va='bottom', fontsize=7.5, fontweight='bold', color='#2C3E50')
+            # 只显示百分比，如果百分比太小则不显示
+            if percentage >= 0.5:  # 只显示大于0.5%的标签
+                ax.text(bar.get_x() + bar.get_width()/2., height + max_percentage * 0.02,
+                       f'{percentage:.1f}%',
+                       ha='center', va='bottom', fontsize=7.5, fontweight='bold', color='#2C3E50')
     
     # 添加统计线（需要转换为柱状图的x坐标）
     # 找到平均值、中位数、95%分位数所在的区间
@@ -218,11 +224,11 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     median_bin_idx = find_bin_index(median_num_sigma)
     p95_bin_idx = find_bin_index(p95_num_sigma)
     
-    # 添加统计线（美化样式，使用更细的线条）
-    ax.axvline(avg_bin_idx + 0.5, color='#E74C3C', linestyle='--', linewidth=1.5, 
-               alpha=0.8, label=f'Mean: {avg_num_sigma:.2f}')
-    ax.axvline(median_bin_idx + 0.5, color='#27AE60', linestyle='--', linewidth=1.5, 
-               alpha=0.8, label=f'Median: {median_num_sigma:.2f}')
+    # 添加统计线（美化样式，使用更细的线条，更好的颜色）
+    ax.axvline(avg_bin_idx + 0.5, color='#E74C3C', linestyle='--', linewidth=1.8, 
+               alpha=0.85, label=f'Mean: {avg_num_sigma:.2f}', zorder=3)
+    ax.axvline(median_bin_idx + 0.5, color='#27AE60', linestyle='--', linewidth=1.8, 
+               alpha=0.85, label=f'Median: {median_num_sigma:.2f}', zorder=3)
     # ax.axvline(p95_bin_idx + 0.5, color='#F39C12', linestyle='--', linewidth=1.2, 
             #    alpha=0.7, label=f'95th: {p95_num_sigma:.2f}')
     
@@ -240,31 +246,36 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     
     # 设置标签和标题（美化样式，匹配论文格式）
     ax.set_xlabel('S_max / σ Range', fontsize=9, fontweight='normal', color='#000000')
-    ax.set_ylabel('Frequency', fontsize=9, fontweight='normal', color='#000000')
+    ax.set_ylabel('Percentage (%)', fontsize=9, fontweight='normal', color='#000000')
     
-    # Make y-axis tick labels bold for visibility
+    # Make y-axis tick labels bold for visibility and format as percentage
     ax.tick_params(axis='y', labelsize=8, colors='#333333', which='major')
+    # 格式化 y 轴刻度标签为百分比
+    yticks = ax.get_yticks()
+    ax.set_yticklabels([f'{y:.1f}%' for y in yticks])
     for label in ax.get_yticklabels():
         label.set_fontweight('bold')
     
-    ax.set_title(f'S_max / σ Distribution\n{folder.name} ({len(num_sigma_list)} files)', 
+    ax.set_title(f'S_max / σ Distribution)', 
                  fontsize=10, fontweight='bold', pad=12, color='#000000')
     
     # 添加网格（美化样式，更轻的网格）
-    ax.grid(True, alpha=0.25, linestyle='--', linewidth=0.5, color='#CCCCCC', axis='y')
+    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, color='#CCCCCC', axis='y', zorder=0)
     ax.set_axisbelow(True)
     
-    # 添加图例（美化样式）
-    ax.legend(loc='upper left', fontsize=8, framealpha=0.9, edgecolor='#E0E0E0', 
-              facecolor='white', frameon=True)
+    # 添加图例（美化样式，更好的视觉效果）
+    legend = ax.legend(loc='upper left', fontsize=8, framealpha=0.95, 
+                       edgecolor='#D0D0D0', facecolor='white', frameon=True,
+                       borderpad=0.8, handlelength=2.0, handletextpad=0.6)
+    legend.get_frame().set_linewidth(1.0)
     
-    # 设置背景色
-    ax.set_facecolor('#F8F9FA')
+    # 设置背景色（更柔和的背景）
+    ax.set_facecolor('#FAFAFA')
     fig.patch.set_facecolor('white')
     
-    # 边框样式（美化样式，更细的边框）
+    # 边框样式（美化样式，更细的边框，更柔和的颜色）
     for spine in ax.spines.values():
-        spine.set_edgecolor('#E0E0E0')
+        spine.set_edgecolor('#D5D5D5')
         spine.set_linewidth(1.0)
     
     # 使用 tight_layout 并调整边距（为旋转的标签留出更多底部空间）
