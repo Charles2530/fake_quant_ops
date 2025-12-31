@@ -1382,7 +1382,7 @@ def _process_single_tensor(tensor_file, minus_exp, elem_format, scale_bits, bloc
 def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1', 
                                       target_values=[0, 0.5, 1, 1.5, 2, 3, 4, 6],
                                       output_dir=None, scale_bits=8, block_size=32, axes=-1,
-                                      minus_exp_list=[0, 1, 2], num_workers=4):
+                                      minus_exp_list=[0, 1, 2], num_workers=32):
     """
     Analyze value distribution for all tensor files in a folder.
     Supports multiple minus_exp values and generates separate plots for each.
@@ -1397,7 +1397,9 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
         block_size (int): Block size for tiling
         axes (int): Axes for shared exponent calculation
         minus_exp_list (list): List of minus_exp values to test (default: [0, 1, 2])
-        num_workers (int): Number of worker threads for parallel processing (default: 4)
+        num_workers (int): Number of worker threads for parallel processing (default: 32).
+                           Recommended: 0.25-0.5x CPU cores for CPU-bound tasks, or 0.5-1x for I/O-bound tasks.
+                           Adjust based on available memory and tensor sizes.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -1720,12 +1722,13 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
         print(f"\nProcessing minus_exp = {minus_exp} for zeroing loss analysis...")
         
         # 使用多线程重新处理每个tensor以获取详细统计
+        # 注意：不需要保存quantized_tensor，只保存distribution即可，避免内存溢出
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             future_to_tensor = {
                 executor.submit(
                     _process_single_tensor,
                     tensor_file, minus_exp, elem_format, scale_bits,
-                    block_size, axes, target_values, return_quantized=True
+                    block_size, axes, target_values, return_quantized=False
                 ): tensor_file
                 for tensor_file in tensor_files
             }
@@ -1757,8 +1760,8 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
                             'minus_exp': minus_exp,
                             'zero_percent': zero_percent,
                             'large_percent': large_percent,  # 4,5,6的总比例
-                            'distribution': distribution,
-                            'quantized_tensor': result['quantized_tensor']
+                            'distribution': distribution
+                            # 不再保存quantized_tensor，避免内存溢出
                         })
                     
                     pbar.update(1)
@@ -1980,8 +1983,10 @@ Examples:
                         help='Axes for shared exponent calculation (default: -1)')
     parser.add_argument('--minus-exp-list', type=int, nargs='+', default=[0, 1, 2],
                         help='List of minus_exp values to test (default: 0 1 2). Ignored if minus_exp positional argument is provided.')
-    parser.add_argument('--num-workers', type=int, default=64,
-                        help='Number of worker threads for parallel processing (default: 4)')
+    parser.add_argument('--num-workers', type=int, default=32,
+                        help='Number of worker threads for parallel processing (default: 32). '
+                             'Recommended: 0.25-0.5x CPU cores for CPU-bound tasks, or 0.5-1x for I/O-bound tasks. '
+                             'Adjust based on available memory and tensor sizes.')
     
     args = parser.parse_args()
     
