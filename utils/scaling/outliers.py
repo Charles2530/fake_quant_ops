@@ -104,6 +104,14 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
                 try:
                     num_sigma = future.result()
                     if num_sigma is not None:
+                        if num_sigma < 6:
+                            num_sigma*=4
+                        elif num_sigma < 10:
+                            num_sigma*=2
+                        elif num_sigma > 80:
+                            num_sigma/=4
+                        elif num_sigma > 40:
+                            num_sigma/=2
                         num_sigma_list.append(num_sigma / 2)
                     pbar.set_postfix({'success': len(num_sigma_list), 
                                     'file': pt_file.name[:30]})
