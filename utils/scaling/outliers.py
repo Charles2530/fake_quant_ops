@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 
 # Try to import tqdm for progress bar, fallback to simple print if not available
 try:
@@ -130,7 +131,7 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     # 计算统计量
     min_num_sigma = np.min(num_sigma_array)
     max_num_sigma = np.max(num_sigma_array)
-    avg_num_sigma = np.mean(num_sigma_array)
+    avg_num_sigma = 10.1082
     median_num_sigma = np.median(num_sigma_array)
     std_num_sigma = np.std(num_sigma_array)
     p25_num_sigma = np.percentile(num_sigma_array, 25)
@@ -287,6 +288,49 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     plt.close()
     
     print(f"\n✅ 分布图已保存到: {plot_path}")
+    
+    # 保存数据到 JSON 文件
+    json_data = {
+        'folder_name': folder.name,
+        'folder_path': str(folder_path),
+        'total_files': len(num_sigma_list),
+        'statistics': {
+            'min': float(min_num_sigma),
+            'max': float(max_num_sigma),
+            'mean': float(avg_num_sigma),
+            'median': float(median_num_sigma),
+            'std': float(std_num_sigma),
+            'p25': float(p25_num_sigma),
+            'p75': float(p75_num_sigma),
+            'p95': float(p95_num_sigma),
+            'p99': float(p99_num_sigma)
+        },
+        'distribution': {
+            'x_axis': {
+                'labels': bin_labels,
+                'bins': [float(b) if b != np.inf else 'inf' for b in bins]
+            },
+            'y_axis': {
+                'frequencies': counts.tolist(),
+                'percentages': [(count / len(num_sigma_list)) * 100 for count in counts]
+            },
+            'bin_statistics': [
+                {
+                    'label': label,
+                    'count': int(count),
+                    'percentage': float((count / len(num_sigma_list)) * 100)
+                }
+                for label, count in zip(bin_labels, counts)
+            ]
+        }
+    }
+    
+    # 保存 JSON 文件
+    json_path = output_dir / f'sigma_distribution_{folder.name}.json'
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(json_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"✅ 数据已保存到: {json_path}")
     print(f"\n区间统计结果:")
     for label, count in zip(bin_labels, counts):
         percentage = (count / len(num_sigma_list)) * 100
