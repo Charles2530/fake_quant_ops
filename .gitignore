@@ -20,12 +20,12 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
+logs/
 # PyTorch
 *.pth
 *.pt
 *.ckpt
-draw/
+/draw/
 # Jupyter Notebook
 .ipynb_checkpoints
 

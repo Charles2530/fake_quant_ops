@@ -64,6 +64,146 @@ def compute_smax_gamma(file_path):
     return num_sigma
 
 
+def plot_from_json(json_path, output_dir=None):
+    """
+    从 JSON 文件读取数据并绘制分布图
+    
+    Args:
+        json_path: JSON 文件路径
+        output_dir: 输出目录（如果为 None，使用 JSON 文件所在目录）
+    """
+    json_path = Path(json_path)
+    if not json_path.exists():
+        print(f"错误: JSON 文件不存在: {json_path}")
+        return
+    
+    # 加载 JSON 数据
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            json_data = json.load(f)
+    except Exception as e:
+        print(f"错误: 无法加载 JSON 文件: {e}")
+        return
+    
+    # 提取数据
+    folder_name = json_data.get('folder_name', 'unknown')
+    bin_labels = json_data['distribution']['x_axis']['labels']
+    percentages = json_data['distribution']['y_axis']['percentages']
+    total_files = json_data.get('total_files', 0)
+    
+    # 设置输出目录
+    if output_dir is None:
+        output_dir = json_path.parent
+    else:
+        output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 绘制分布图
+    try:
+        plt.style.use('seaborn-v0_8-darkgrid')
+    except:
+        try:
+            plt.style.use('seaborn-darkgrid')
+        except:
+            plt.style.use('default')
+    
+    # 使用渐变色（viridis colormap，更柔和的颜色）
+    colors = plt.cm.viridis(np.linspace(0.25, 0.85, len(bin_labels)))
+    
+    # Paper-ready size (调整宽度以适应更多柱子，更扁更长的图表)
+    num_bins = len(bin_labels)
+    fig_width = max(7.0, num_bins * 0.35)  # 增加宽度，让图表更长
+    fig_height = 3.2  # 稍微增加高度，为标签留出更多空间
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    
+    max_percentage = max(percentages) if percentages else 0
+    
+    # 绘制柱状图（使用百分比数据，美化样式，更细的柱子，更好的视觉效果）
+    # 根据柱子数量调整宽度，柱子多时更细
+    bar_width = max(0.4, min(0.6, 0.8 - num_bins * 0.01))  # 柱子多时更细
+    bars = ax.bar(range(len(bin_labels)), percentages, alpha=0.9, color=colors, 
+                  edgecolor='white', linewidth=1.2, width=bar_width, 
+                  zorder=2)  # 确保柱子在网格上方
+    
+    # 在柱状图上添加数值标签（美化样式，显示百分比，统一放在柱子上方，黑色文字）
+    # 由于图表更长了，可以显示更多标签
+    threshold = max(percentages) * 0.03  # 只显示大于最大值3%的标签，或者至少0.5%
+    min_threshold = max(0.5, threshold)  # 至少0.5%
+    
+    for i, (bar, percentage) in enumerate(zip(bars, percentages)):
+        if percentage > 0 and percentage >= min_threshold:
+            height = bar.get_height()
+            
+            # 统一放在柱子上方，使用黑色文字
+            y_pos = height + max_percentage * 0.03  # 放在柱子上方，增加间距
+            text_color = '#2C3E50'  # 黑色文字
+            
+            # 由于图表更长了，可以使用稍大的字体
+            ax.text(bar.get_x() + bar.get_width()/2., y_pos,
+                   f'{percentage:.1f}%',
+                   ha='center', va='bottom', fontsize=7.0, fontweight='bold', 
+                   color=text_color)
+    
+    # 设置x轴标签（美化样式）
+    # 每个柱子都对应一个横坐标标记
+    ax.set_xticks(range(len(bin_labels)))
+    # 根据柱子数量调整字体大小，避免重叠
+    if len(bin_labels) > 20:
+        fontsize = 6.5
+    elif len(bin_labels) > 15:
+        fontsize = 7.0
+    else:
+        fontsize = 7.5
+    ax.set_xticklabels(bin_labels, fontsize=fontsize, fontweight='bold', rotation=45, ha='right')
+    
+    # 设置标签和标题（美化样式，匹配论文格式）
+    ax.set_xlabel('S_max / σ Range', fontsize=9, fontweight='normal', color='#000000')
+    ax.set_ylabel('Percentage (%)', fontsize=9, fontweight='normal', color='#000000')
+    
+    # Make y-axis tick labels bold for visibility and format as percentage
+    ax.tick_params(axis='y', labelsize=8, colors='#333333', which='major')
+    # 格式化 y 轴刻度标签为百分比
+    yticks = ax.get_yticks()
+    ax.set_yticklabels([f'{y:.1f}%' for y in yticks])
+    for label in ax.get_yticklabels():
+        label.set_fontweight('bold')
+    
+    ax.set_title(f'S_max / σ Distribution', 
+                 fontsize=10, fontweight='bold', pad=12, color='#000000')
+    
+    # 添加网格（美化样式，更轻的网格）
+    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, color='#CCCCCC', axis='y', zorder=0)
+    ax.set_axisbelow(True)
+    
+    # 设置背景色（更柔和的背景）
+    ax.set_facecolor('#FAFAFA')
+    fig.patch.set_facecolor('white')
+    
+    # 边框样式（美化样式，更细的边框，更柔和的颜色）
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#D5D5D5')
+        spine.set_linewidth(1.0)
+    
+    # 使用 tight_layout 并调整边距（为旋转的标签留出更多底部空间）
+    # 由于图表更扁了，需要更多底部空间
+    if len(bin_labels) > 15:
+        plt.tight_layout(pad=1.2, rect=[0, 0.12, 1, 1])  # 底部留出更多空间
+    else:
+        plt.tight_layout(pad=1.2, rect=[0, 0.08, 1, 1])  # 即使柱子不多也留出空间
+    
+    # 保存图片（高分辨率，适合论文）
+    plot_path = output_dir / f'sigma_distribution_{folder_name}.pdf'
+    plt.savefig(plot_path, format='pdf', dpi=600, bbox_inches='tight', 
+                facecolor='white', edgecolor='none', pad_inches=0.05,
+                metadata={'Creator': 'Outliers Analyzer', 
+                         'Title': f'S_max / σ Distribution - {folder_name}'})
+    plt.close()
+    
+    print(f"\n✅ 分布图已保存到: {plot_path}")
+    print(f"   从 JSON 文件加载: {json_path}")
+    print(f"   总文件数: {total_files}")
+
+
 def analyze_folder(folder_path, output_dir=None, num_workers=32):
     """
     统计文件夹下所有 tensor 文件的 Smax/gamma 的最小值和平均值，并绘制分布图
@@ -186,7 +326,7 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     # Paper-ready size (调整宽度以适应更多柱子，更扁更长的图表)
     num_bins = len(bin_labels)
     fig_width = max(7.0, num_bins * 0.35)  # 增加宽度，让图表更长
-    fig_height = 2.8  # 减少高度，让图表更扁
+    fig_height = 3.2  # 稍微增加高度，为标签留出更多空间
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     
     # 计算百分比
@@ -200,7 +340,7 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
                   edgecolor='white', linewidth=1.2, width=bar_width, 
                   zorder=2)  # 确保柱子在网格上方
     
-    # 在柱状图上添加数值标签（美化样式，显示百分比，避免重叠）
+    # 在柱状图上添加数值标签（美化样式，显示百分比，统一放在柱子上方，黑色文字）
     # 由于图表更长了，可以显示更多标签
     threshold = max(percentages) * 0.03  # 只显示大于最大值3%的标签，或者至少0.5%
     min_threshold = max(0.5, threshold)  # 至少0.5%
@@ -209,58 +349,29 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
         if percentage > 0 and percentage >= min_threshold:
             height = bar.get_height()
             
-            # 如果柱子足够高，标签放在上方；否则放在柱子内部
-            if height >= max_percentage * 0.12:  # 柱子高度超过最大值的12%
-                y_pos = height + max_percentage * 0.025  # 稍微增加间距
-                text_color = '#2C3E50'
-                va = 'bottom'
-            else:
-                # 柱子太矮，标签放在柱子内部
-                y_pos = height * 0.6
-                text_color = 'white'
-                va = 'center'
+            # 统一放在柱子上方，使用黑色文字
+            y_pos = height + max_percentage * 0.03  # 放在柱子上方，增加间距
+            text_color = '#2C3E50'  # 黑色文字
             
             # 由于图表更长了，可以使用稍大的字体
             ax.text(bar.get_x() + bar.get_width()/2., y_pos,
                    f'{percentage:.1f}%',
-                   ha='center', va=va, fontsize=7.0, fontweight='bold', 
+                   ha='center', va='bottom', fontsize=7.0, fontweight='bold', 
                    color=text_color)
     
-    # 添加统计线（需要转换为柱状图的x坐标）
-    # 找到平均值、中位数、95%分位数所在的区间
-    def find_bin_index(value):
-        for i in range(len(bins)-1):
-            if i == len(bins) - 2:  # 最后一个区间（20+）
-                if value >= bins[i]:
-                    return i
-            else:
-                if bins[i] <= value < bins[i+1]:
-                    return i
-        return len(bins) - 2  # 默认返回最后一个区间
-    
-    avg_bin_idx = find_bin_index(avg_num_sigma)
-    median_bin_idx = find_bin_index(median_num_sigma)
-    p95_bin_idx = find_bin_index(p95_num_sigma)
-    
-    # 添加统计线（美化样式，使用更细的线条，更好的颜色）
-    ax.axvline(avg_bin_idx + 0.5, color='#E74C3C', linestyle='--', linewidth=1.8, 
-               alpha=0.85, label=f'Mean: {avg_num_sigma:.2f}', zorder=3)
-    ax.axvline(median_bin_idx + 0.5, color='#27AE60', linestyle='--', linewidth=1.8, 
-               alpha=0.85, label=f'Median: {median_num_sigma:.2f}', zorder=3)
-    # ax.axvline(p95_bin_idx + 0.5, color='#F39C12', linestyle='--', linewidth=1.2, 
-            #    alpha=0.7, label=f'95th: {p95_num_sigma:.2f}')
+    # 统计线已移除（Mean 和 Median）
     
     # 设置x轴标签（美化样式）
-    # 如果柱子太多，可以只显示部分标签或旋转
+    # 每个柱子都对应一个横坐标标记
     ax.set_xticks(range(len(bin_labels)))
-    if len(bin_labels) > 15:
-        # 柱子太多时，只显示部分标签（每隔一个显示）
-        tick_positions = range(0, len(bin_labels), 2)
-        tick_labels = [bin_labels[i] if i < len(bin_labels) else '' for i in tick_positions]
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels(tick_labels, fontsize=7, fontweight='bold', rotation=45, ha='right')
+    # 根据柱子数量调整字体大小，避免重叠
+    if len(bin_labels) > 20:
+        fontsize = 6.5
+    elif len(bin_labels) > 15:
+        fontsize = 7.0
     else:
-        ax.set_xticklabels(bin_labels, fontsize=7.5, fontweight='bold', rotation=45, ha='right')
+        fontsize = 7.5
+    ax.set_xticklabels(bin_labels, fontsize=fontsize, fontweight='bold', rotation=45, ha='right')
     
     # 设置标签和标题（美化样式，匹配论文格式）
     ax.set_xlabel('S_max / σ Range', fontsize=9, fontweight='normal', color='#000000')
@@ -281,11 +392,7 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, color='#CCCCCC', axis='y', zorder=0)
     ax.set_axisbelow(True)
     
-    # 添加图例（美化样式，更好的视觉效果）
-    legend = ax.legend(loc='upper left', fontsize=8, framealpha=0.95, 
-                       edgecolor='#D0D0D0', facecolor='white', frameon=True,
-                       borderpad=0.8, handlelength=2.0, handletextpad=0.6)
-    legend.get_frame().set_linewidth(1.0)
+    # 图例已移除（Mean 和 Median 统计线已移除）
     
     # 设置背景色（更柔和的背景）
     ax.set_facecolor('#FAFAFA')
@@ -368,10 +475,10 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="统计文件夹下所有 tensor 文件的 Smax/gamma 统计信息并绘制分布图")
-    parser.add_argument("path", type=str, help="要分析的文件夹路径或单个 .pt 文件路径")
+    parser = argparse.ArgumentParser(description="统计文件夹下所有 tensor 文件的 Smax/gamma 统计信息并绘制分布图，或从 JSON 文件直接绘图")
+    parser.add_argument("path", type=str, help="要分析的文件夹路径、单个 .pt 文件路径或 JSON 文件路径")
     parser.add_argument("--output-dir", type=str, default=None,
-                        help="输出目录，用于保存分布图 (默认: ./draw/outliers/)")
+                        help="输出目录，用于保存分布图 (默认: ./draw/outliers/ 或 JSON 文件所在目录)")
     parser.add_argument("--num-workers", type=int, default=32,
                         help="线程数，用于并行处理文件 (默认: 32)。"
                              "推荐：0.25-0.5x CPU核心数用于CPU密集型任务，"
@@ -379,13 +486,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     path = Path(args.path)
-    if path.is_file() and path.suffix == ".pt":
-        # 如果是单个文件，计算并输出
-        num_sigma = compute_smax_gamma(path)
-        if num_sigma is not None:
-            print(f"S_max / sigma = {num_sigma:.4f}")
+    if path.is_file():
+        if path.suffix == ".json":
+            # 如果是 JSON 文件，直接绘图
+            plot_from_json(path, output_dir=args.output_dir)
+        elif path.suffix == ".pt":
+            # 如果是单个 .pt 文件，计算并输出
+            num_sigma = compute_smax_gamma(path)
+            if num_sigma is not None:
+                print(f"S_max / sigma = {num_sigma:.4f}")
+        else:
+            print(f"错误: 不支持的文件类型: {path.suffix}")
     elif path.is_dir():
         # 如果是文件夹，统计所有文件并绘制分布图
         analyze_folder(path, output_dir=args.output_dir, num_workers=args.num_workers)
     else:
-        print(f"错误: {args.path} 不是一个有效的文件夹或 .pt 文件路径")
+        print(f"错误: {args.path} 不是一个有效的文件夹、.pt 文件或 .json 文件路径")
