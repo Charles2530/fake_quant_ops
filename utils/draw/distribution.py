@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import argparse
 from pathlib import Path
 from scipy.stats import laplace
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 # Import data format information from layer_analysis
 import sys
@@ -80,6 +82,26 @@ def detect_data_format(filename):
         if fmt in filename:
             return fmt
     return None
+
+def process_single_file(filepath, output_dir):
+    """Process a single tensor file and create its distribution plot."""
+    try:
+        # Load and process tensor
+        tensor_data, data_format, filename = load_and_process_tensor(str(filepath))
+        
+        if tensor_data is None:
+            return None, f"Failed to load or process: {filepath.name}"
+        
+        # Setup output path
+        output_filename = filepath.stem + '.png'
+        output_path = output_dir / output_filename
+        
+        # Create distribution plot
+        analysis_summary = create_distribution_plot(tensor_data, data_format, filename, output_path)
+        
+        return analysis_summary, None
+    except Exception as e:
+        return None, f"Error processing {filepath.name}: {str(e)}"
 
 def create_distribution_plot(tensor_data, data_format, filename, output_path):
     """
@@ -218,64 +240,118 @@ def create_distribution_plot(tensor_data, data_format, filename, output_path):
 def main():
     """Main function for distribution analysis."""
     parser = argparse.ArgumentParser(description='Generate tensor value distribution plots with representable values overlay')
-    parser.add_argument('input_file', help='Path to tensor file (.pt)')
+    parser.add_argument('input_path', help='Path to tensor file (.pt) or directory containing .pt files')
     parser.add_argument('--output-dir', default='./draw/distribution_tensor/', 
                         help='Output directory for plots (default: ./draw/distribution_tensor/)')
+    parser.add_argument('--num-workers', type=int, default=32,
+                        help='Number of worker threads for parallel processing (default: 32)')
     parser.add_argument('--show-stats', action='store_true',
                         help='Print detailed statistics to console')
     
     args = parser.parse_args()
     
-    # Validate input file
-    input_path = Path(args.input_file)
+    # Validate input path
+    input_path = Path(args.input_path)
     if not input_path.exists():
-        print(f"Error: Input file does not exist: {input_path}")
-        return 1
-    
-    if not input_path.is_file():
-        print(f"Error: Input path is not a file: {input_path}")
+        print(f"Error: Input path does not exist: {input_path}")
         return 1
     
     # Setup output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Generate output filename: same as input but with .png extension
-    output_filename = input_path.stem + '.png'
-    output_path = output_dir / output_filename
-    
-    print(f"Analyzing tensor distribution: {input_path.name}")
-    print("=" * 60)
-    
-    # Load and process tensor
-    tensor_data, data_format, filename = load_and_process_tensor(str(input_path))
-    
-    if tensor_data is None:
-        print("Failed to load or process tensor file.")
+    # Check if input is a file or directory
+    if input_path.is_file():
+        # Single file processing
+        print(f"Analyzing tensor distribution: {input_path.name}")
+        print("=" * 60)
+        
+        # Load and process tensor
+        tensor_data, data_format, filename = load_and_process_tensor(str(input_path))
+        
+        if tensor_data is None:
+            print("Failed to load or process tensor file.")
+            return 1
+        
+        print(f"Data format detected: {data_format.upper()}")
+        print(f"Tensor elements: {len(tensor_data):,}")
+        print(f"Value range: [{np.min(tensor_data):.6f}, {np.max(tensor_data):.6f}]")
+        
+        # Generate output filename
+        output_filename = input_path.stem + '.png'
+        output_path = output_dir / output_filename
+        
+        # Create distribution plot
+        analysis_summary = create_distribution_plot(tensor_data, data_format, filename, output_path)
+        
+        # Print summary statistics if requested
+        if args.show_stats:
+            print("\nDetailed Analysis Summary:")
+            print("-" * 40)
+            print(f"Data Format: {analysis_summary['data_format'].upper()}")
+            print(f"Total Elements: {analysis_summary['total_elements']:,}")
+            print(f"Value Range: [{analysis_summary['value_range'][0]:.6f}, {analysis_summary['value_range'][1]:.6f}]")
+            print(f"Mean ± Std: {analysis_summary['mean_std'][0]:.6f} ± {analysis_summary['mean_std'][1]:.6f}")
+            print(f"Median: {analysis_summary['median']:.6f}")
+            print(f"Laplace Fit - Location (μ): {analysis_summary['laplace_loc']:.6f}")
+            print(f"Laplace Fit - Scale (b): {analysis_summary['laplace_scale']:.6f}")
+            print(f"Representable Values Shown: {analysis_summary['representable_values_shown']}")
+        
+        print(f"\nVisualization complete!")
+        print(f"Plot saved to: {output_path}")
+        
+    elif input_path.is_dir():
+        # Directory processing with multithreading
+        pt_files = list(input_path.glob('*.pt'))
+        if len(pt_files) == 0:
+            print(f"Error: No .pt files found in directory: {input_path}")
+            return 1
+        
+        print(f"Found {len(pt_files)} tensor files in {input_path}")
+        print("=" * 60)
+        print(f"Processing {len(pt_files)} files with {args.num_workers} workers...")
+        
+        successful_count = 0
+        failed_count = 0
+        
+        with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(process_single_file, filepath, output_dir): filepath 
+                for filepath in pt_files
+            }
+            
+            # Process completed tasks with progress bar
+            with tqdm(total=len(pt_files), desc="Processing files") as pbar:
+                for future in as_completed(future_to_file):
+                    filepath = future_to_file[future]
+                    try:
+                        analysis_summary, error = future.result()
+                        if analysis_summary is not None:
+                            successful_count += 1
+                            if args.show_stats:
+                                print(f"\n{filepath.name}:")
+                                print(f"  Data Format: {analysis_summary['data_format'].upper()}")
+                                print(f"  Total Elements: {analysis_summary['total_elements']:,}")
+                                print(f"  Value Range: [{analysis_summary['value_range'][0]:.6f}, {analysis_summary['value_range'][1]:.6f}]")
+                        else:
+                            failed_count += 1
+                            if error:
+                                print(f"\nError: {error}")
+                    except Exception as e:
+                        failed_count += 1
+                        print(f"\nError processing {filepath.name}: {e}")
+                    finally:
+                        pbar.update(1)
+        
+        print(f"\nProcessing complete!")
+        print(f"Successfully processed: {successful_count}/{len(pt_files)}")
+        if failed_count > 0:
+            print(f"Failed: {failed_count}")
+        print(f"Plots saved to: {output_dir}")
+    else:
+        print(f"Error: Input path is neither a file nor a directory: {input_path}")
         return 1
-    
-    print(f"Data format detected: {data_format.upper()}")
-    print(f"Tensor elements: {len(tensor_data):,}")
-    print(f"Value range: [{np.min(tensor_data):.6f}, {np.max(tensor_data):.6f}]")
-    
-    # Create distribution plot
-    analysis_summary = create_distribution_plot(tensor_data, data_format, filename, output_path)
-    
-    # Print summary statistics if requested
-    if args.show_stats:
-        print("\nDetailed Analysis Summary:")
-        print("-" * 40)
-        print(f"Data Format: {analysis_summary['data_format'].upper()}")
-        print(f"Total Elements: {analysis_summary['total_elements']:,}")
-        print(f"Value Range: [{analysis_summary['value_range'][0]:.6f}, {analysis_summary['value_range'][1]:.6f}]")
-        print(f"Mean ± Std: {analysis_summary['mean_std'][0]:.6f} ± {analysis_summary['mean_std'][1]:.6f}")
-        print(f"Median: {analysis_summary['median']:.6f}")
-        print(f"Laplace Fit - Location (μ): {analysis_summary['laplace_loc']:.6f}")
-        print(f"Laplace Fit - Scale (b): {analysis_summary['laplace_scale']:.6f}")
-        print(f"Representable Values Shown: {analysis_summary['representable_values_shown']}")
-    
-    print(f"\nVisualization complete!")
-    print(f"Plot saved to: {output_path}")
     
     return 0
 
