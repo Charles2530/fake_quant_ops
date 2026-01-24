@@ -241,20 +241,19 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
 
     # log2(shared_exp) and truncate to integer
     if minus_exp is not None:
-        if minus_exp == "auto-fix":
-            shared_exp = torch.floor(
-                torch.log2(
-                    shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
-                )
+        shared_exp = torch.ceil(
+            torch.log2(
+                shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
             )
-        else:
-            shared_exp = torch.ceil(
-                torch.log2(
-                    shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
-                )
-            )
+        )
         if isinstance(minus_exp, str) and "auto" in minus_exp:
-            if minus_exp == "auto" or minus_exp == "auto-fix":     
+            if minus_exp == "auto":     
+                minus_exp_result = calculate_minus_mse_exp(
+                    A, scale_bits=8, elem_format=elem_format, 
+                    shared_exp_method=method, axes=axes, block_size=32, 
+                    round="nearest", flush_fp32_subnorms=False,minus_level=minus_level
+                )
+            elif minus_exp == "auto-fix":
                 minus_exp_result = calculate_minus_mse_exp(
                     A, scale_bits=8, elem_format=elem_format, 
                     shared_exp_method=method, axes=axes, block_size=32, 
@@ -505,26 +504,6 @@ def calculate_minus_mse_exp(
     flush_fp32_subnorms=False,
     minus_level:float=1.0,
 ):
-    """
-    Calculate optimal minus_exp based on MSE comparison between minus_exp=0 and minus_exp=-1.
-    
-    This function quantizes the input tensor with two different minus_exp values (0 and -1),
-    compares their MSE per block, and returns the optimal minus_exp for each block.
-    
-    Args:
-        A: Input tensor to quantize
-        scale_bits: Number of bits for scale
-        elem_format: Element format (e.g., 'fp8_e5m2', 'fp4_e2m1')
-        shared_exp_method: Method for shared exponent calculation ("max" or "none")
-        axes: Axes along which to calculate shared exponents
-        block_size: Block size for block-wise quantization (0 means no blocking)
-        round: Rounding method
-        flush_fp32_subnorms: Whether to flush FP32 subnormals
-    
-    Returns:
-        best_minus_exp_per_block: Tensor with optimal minus_exp for each block (-1 or 0)
-                                 If block_size=0, returns a scalar (0 or -1)
-    """
     if elem_format == None:
         # If no quantization format, return 0 (no minus_exp adjustment needed)
         return 0
@@ -655,6 +634,158 @@ def calculate_minus_mse_exp(
         else:
             best_minus_exp = 0
         # Return scalar value when block_size=0, similar to reference code
+        best_minus_exp_per_block = best_minus_exp
+    
+    return best_minus_exp_per_block
+
+def calculate_minus_mse_exp_sigfma(
+    A,
+    scale_bits,
+    elem_format,
+    shared_exp_method="max",
+    axes=None,
+    block_size=0,
+    round="nearest",
+    flush_fp32_subnorms=False,
+    minus_level:float=1.0,
+):
+    """
+    Calculate minus_exp based on max value comparison with 4.14*sigma.
+    For each block, compare max and max/2 to see which is closer to 4.14*sigma.
+    If max/2 is closer, use half scale (minus_level), otherwise use 0.
+    
+    Args:
+        A: Input tensor
+        scale_bits: Number of bits for scale exponent
+        elem_format: Element format for quantization
+        shared_exp_method: Method for calculating shared exponents
+        axes: Axes along which to calculate shared exponents
+        block_size: Size of blocks for per-block processing
+        round: Rounding mode
+        flush_fp32_subnorms: Whether to flush FP32 subnormals
+        minus_level: The minus level to use when variance threshold is exceeded
+    
+    Returns:
+        best_minus_exp_per_block: Tensor of minus_exp values per block (or scalar if block_size=0)
+    """
+    if elem_format == None:
+        # If no quantization format, return 0 (no minus_exp adjustment needed)
+        return 0
+    
+    assert(scale_bits > 0)
+    if axes is None:
+        axes = []
+    else:
+        axes = [axes] if type(axes) == int else axes
+        axes = [x + A.ndim if x < 0 else x for x in axes]
+    
+    ebits, mbits, emax, max_norm, _ = _get_format_params(elem_format)
+    
+    # Check if axes are valid for current A shape
+    # If axes contain values >= A.ndim, it means A is already reshaped and axes are already adjusted
+    if block_size > 0 and axes:
+        axes_valid = all(0 <= ax < A.ndim for ax in axes)
+        if axes_valid:
+            # A is not reshaped yet, do reshape
+            try:
+                A_reshaped, axes_reshaped, orig_shape, padded_shape = _reshape_to_blocks(
+                    A, axes, block_size
+                )
+                shared_exp_axes = [x + 1 for x in axes_reshaped]
+            except (IndexError, AssertionError):
+                # If reshape fails (e.g., axes out of range), assume A is already reshaped
+                A_reshaped = A
+                shared_exp_axes = axes
+        else:
+            # Axes are out of range, assume A is already reshaped
+            A_reshaped = A
+            shared_exp_axes = axes
+    else:
+        A_reshaped = A
+        shared_exp_axes = axes if axes is not None else []
+    
+    # Calculate shared_exp with minus_exp=0
+    shared_exp = _shared_exponents(
+        A_reshaped, method=shared_exp_method, axes=shared_exp_axes, ebits=0,
+        elem_format=elem_format, minus_exp=0, heuristic_level=None,
+    )
+    
+    if flush_fp32_subnorms:
+        A_reshaped = A_reshaped * (shared_exp > -FP32_EXPONENT_BIAS).type(A.dtype)
+    
+    shared_exp = shared_exp - emax
+    
+    scale_emax = 2**(scale_bits-1) - 1
+    shared_exp[shared_exp > scale_emax] = float("NaN")
+    shared_exp[shared_exp < -scale_emax] = -scale_emax
+    
+    # Calculate max per block and compare with 4.14*sigma
+    if block_size > 0:
+        # For each block, compute max along the block dimension
+        A_abs = torch.abs(A_reshaped.to(torch.float32))
+        
+        # Calculate max per block along the shared_exp_axes dimensions
+        max_per_block = A_abs
+        for axis in shared_exp_axes:
+            max_per_block, _ = torch.max(max_per_block, dim=axis, keepdim=True)
+        
+        # Calculate sigma per block (standard deviation) along the shared_exp_axes dimensions
+        sigma_per_block = A_abs
+        for axis in shared_exp_axes:
+            sigma_per_block = torch.std(sigma_per_block, dim=axis, keepdim=True)
+        
+        # Threshold: 4.14 * sigma_per_block (per block)
+        threshold = 4.14 * sigma_per_block
+        
+        # Compare |max - threshold| and |max/2 - threshold|
+        # Choose the one closer to threshold
+        dist_max = torch.abs(max_per_block - threshold)
+        dist_max_half = torch.abs(max_per_block / 2.0 - threshold)
+        use_half = dist_max_half < dist_max
+        # import pdb; pdb.set_trace()
+        # for i in range(max_per_block.shape[-1][0]):
+        # print(f"max_per_block: {max_per_block}, threshold: {threshold}")
+        # list_max_per_block = max_per_block.reshape(-1).squeeze().tolist()
+        # list_threshold = threshold.reshape(-1).squeeze().tolist()
+        # for i in range(len(list_max_per_block)):
+        #     print(f"max_per_block[{i}]: {list_max_per_block[i]}, threshold[{i}]: {list_threshold[i]}")
+        #     if i == 5:
+        #         continue
+        
+        # Ensure use_half has the same shape as shared_exp
+        if use_half.shape != shared_exp.shape:
+            # Try to match shapes by squeezing extra trailing dimensions
+            if use_half.ndim > shared_exp.ndim:
+                while (use_half.ndim > shared_exp.ndim and 
+                       use_half.shape[-1] == 1):
+                    use_half = use_half.squeeze(-1)
+            # If still don't match, try broadcast
+            if use_half.shape != shared_exp.shape:
+                use_half = torch.broadcast_to(use_half, shared_exp.shape).clone()
+        
+        best_minus_exp_per_block = torch.where(
+            use_half,
+            torch.full_like(shared_exp, minus_level, dtype=torch.float),
+            torch.zeros_like(shared_exp)
+        )
+    else:
+        # No blocks, calculate overall max and sigma
+        A_abs = torch.abs(A_reshaped.to(torch.float32))
+        max_val = torch.max(A_abs).item()
+        sigma_val = torch.std(A_abs).item()
+        
+        # Threshold: 4.14 * sigma
+        threshold = 4.14 * sigma_val
+        
+        # Compare |max - threshold| and |max/2 - threshold|
+        # Choose the one closer to threshold
+        dist_max = abs(max_val - threshold)
+        dist_max_half = abs(max_val / 2.0 - threshold)
+        if dist_max_half < dist_max:
+            best_minus_exp = minus_level
+        else:
+            best_minus_exp = 0
+        # Return scalar value when block_size=0
         best_minus_exp_per_block = best_minus_exp
     
     return best_minus_exp_per_block
