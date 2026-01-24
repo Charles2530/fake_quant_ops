@@ -254,7 +254,7 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
                     round="nearest", flush_fp32_subnorms=False,minus_level=minus_level
                 )
             elif minus_exp == "auto-fix":
-                minus_exp_result = calculate_minus_mse_exp(
+                minus_exp_result = calculate_minus_mse_exp_sigfma(
                     A, scale_bits=8, elem_format=elem_format, 
                     shared_exp_method=method, axes=axes, block_size=32, 
                     round="nearest", flush_fp32_subnorms=False,minus_level=minus_level
