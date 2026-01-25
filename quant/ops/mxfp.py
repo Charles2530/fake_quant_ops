@@ -241,11 +241,18 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
 
     # log2(shared_exp) and truncate to integer
     if minus_exp is not None:
-        shared_exp = torch.ceil(
-            torch.log2(
-                shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+        if minus_exp == "auto-fix":
+            shared_exp = torch.floor(
+                torch.log2(
+                    shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+                )
             )
-        )
+        else:
+            shared_exp = torch.ceil(
+                torch.log2(
+                    shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+                )
+            )
         if isinstance(minus_exp, str) and "auto" in minus_exp:
             if minus_exp == "auto":     
                 minus_exp_result = calculate_minus_mse_exp(
@@ -742,15 +749,6 @@ def calculate_minus_mse_exp_sigfma(
         dist_max = torch.abs(max_per_block - threshold)
         dist_max_half = torch.abs(max_per_block / 2.0 - threshold)
         use_half = dist_max_half < dist_max
-        # import pdb; pdb.set_trace()
-        # for i in range(max_per_block.shape[-1][0]):
-        # print(f"max_per_block: {max_per_block}, threshold: {threshold}")
-        # list_max_per_block = max_per_block.reshape(-1).squeeze().tolist()
-        # list_threshold = threshold.reshape(-1).squeeze().tolist()
-        # for i in range(len(list_max_per_block)):
-        #     print(f"max_per_block[{i}]: {list_max_per_block[i]}, threshold[{i}]: {list_threshold[i]}")
-        #     if i == 5:
-        #         continue
         
         # Ensure use_half has the same shape as shared_exp
         if use_half.shape != shared_exp.shape:

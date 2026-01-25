@@ -11,7 +11,7 @@ import os
 # Add the project root to the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from quant.ops.mxfp import calculate_minus_mse_exp_sigfma
+from quant.ops.mxfp import calculate_minus_mse_exp, calculate_minus_mse_exp_sigfma
 
 def load_tensor(file_path):
     """Load tensor from .pt file"""
@@ -62,6 +62,17 @@ def test_calculate_minus_mse_exp_sigfma(tensor, block_size=16, axes=-1, elem_for
     
     # Calculate minus_exp
     try:
+        best_minus_exp = calculate_minus_mse_exp(
+            A=tensor,
+            scale_bits=scale_bits,
+            elem_format=elem_format,
+            shared_exp_method=shared_exp_method,
+            axes=axes,
+            block_size=block_size,
+            round="nearest",
+            flush_fp32_subnorms=False,
+            minus_level=minus_level,
+        )
         result = calculate_minus_mse_exp_sigfma(
             A=tensor,
             scale_bits=scale_bits,
@@ -85,11 +96,14 @@ def test_calculate_minus_mse_exp_sigfma(tensor, block_size=16, axes=-1, elem_for
             num_blocks = result.numel()
             num_half_scale = (result == minus_level).sum().item()
             num_original_scale = (result == 0.0).sum().item()
+            best_minus_exp_result = (result == best_minus_exp).sum().item()
+
             
             print(f"\nBlock Statistics:")
             print(f"  Total blocks: {num_blocks}")
             print(f"  Blocks using half scale (minus_level={minus_level}): {num_half_scale} ({100*num_half_scale/num_blocks:.2f}%)")
             print(f"  Blocks using original scale (0): {num_original_scale} ({100*num_original_scale/num_blocks:.2f}%)")
+            print(f"  Blocks using best minus exp: {best_minus_exp_result} ({100*best_minus_exp_result/num_blocks:.2f}%)")
         else:
             print(f"  Result (scalar): {result}")
         
@@ -124,6 +138,7 @@ def main():
     print("\n" + "="*80)
     print("Test 2: With block_size=32, axes=-1, fp4_e2m1")
     print("="*80)
+    # result1 = test_calculate_minus_mse_exp(tensor, block_size=32, axes=-1, elem_format='fp4_e2m1')
     result2 = test_calculate_minus_mse_exp_sigfma(tensor, block_size=32, axes=-1, elem_format='fp4_e2m1')
     
     print("\n" + "="*80)
