@@ -3,8 +3,28 @@ import numpy as np
 import argparse
 from pathlib import Path
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+
+# Set font to Times New Roman (or Calibri as fallback) for paper figures
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman', 'DejaVu Serif', 'Liberation Serif']
+# Try to use Times New Roman, fallback to Calibri if not available
+try:
+    from matplotlib import font_manager
+    # Check if Times New Roman is available
+    times_fonts = [f.name for f in font_manager.fontManager.ttflist if 'times' in f.name.lower() or 'Times' in f.name]
+    if times_fonts:
+        plt.rcParams['font.serif'] = ['Times New Roman'] + plt.rcParams['font.serif']
+    else:
+        # Fallback to Calibri
+        calibri_fonts = [f.name for f in font_manager.fontManager.ttflist if 'calibri' in f.name.lower() or 'Calibri' in f.name]
+        if calibri_fonts:
+            plt.rcParams['font.family'] = 'sans-serif'
+            plt.rcParams['font.sans-serif'] = ['Calibri'] + plt.rcParams['font.sans-serif']
+except:
+    pass
 
 # Try to import tqdm for progress bar, fallback to simple print if not available
 try:
@@ -110,10 +130,10 @@ def plot_from_json(json_path, output_dir=None):
     # 使用渐变色（viridis colormap，更柔和的颜色）
     colors = plt.cm.viridis(np.linspace(0.25, 0.85, len(bin_labels)))
     
-    # Paper-ready size (调整宽度以适应更多柱子，更扁更长的图表)
+    # Paper-ready size (optimized for single column in Overleaf two-column layout)
     num_bins = len(bin_labels)
-    fig_width = max(7.0, num_bins * 0.35)  # 增加宽度，让图表更长
-    fig_height = 3.2  # 稍微增加高度，为标签留出更多空间
+    fig_width = 3.5  # Single column width in Overleaf
+    fig_height = 2.5  # Adjusted height for single column
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     
     max_percentage = max(percentages) if percentages else 0
@@ -125,51 +145,84 @@ def plot_from_json(json_path, output_dir=None):
                   edgecolor='white', linewidth=1.2, width=bar_width, 
                   zorder=2)  # 确保柱子在网格上方
     
-    # 在柱状图上添加数值标签（美化样式，显示百分比，统一放在柱子上方，黑色文字）
-    # 由于图表更长了，可以显示更多标签
-    threshold = max(percentages) * 0.03  # 只显示大于最大值3%的标签，或者至少0.5%
-    min_threshold = max(0.5, threshold)  # 至少0.5%
+    # Removed percentage labels on bars as requested
     
-    for i, (bar, percentage) in enumerate(zip(bars, percentages)):
-        if percentage > 0 and percentage >= min_threshold:
-            height = bar.get_height()
+    # Calculate total percentage for ranges 9-10, 10-11, 11-12
+    range_9_12_percent = 0.0
+    range_9_12_indices = []
+    for i, label in enumerate(bin_labels):
+        # Check if label matches 9-10, 10-11, or 11-12
+        if label in ['9', '10', '11']:
+            range_9_12_percent += percentages[i]
+            range_9_12_indices.append(i)
+    
+    # Add annotation at the top if we found the ranges
+    if range_9_12_indices:
+        annotation_y = max_percentage * 1.25  # Position above bars
+        stats_text = f'|<--{range_9_12_percent:.1f}%-->|'
+        
+        # Find center position of the range
+        if len(range_9_12_indices) > 0:
+            center_idx = (min(range_9_12_indices) + max(range_9_12_indices)) / 2.0
+        else:
+            center_idx = len(bin_labels) / 2.0
+        
+        # Add annotation at the top center
+        ax.text(center_idx, annotation_y, stats_text,
+                ha='center', va='bottom', fontsize=8, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                        edgecolor='#2C3E50', linewidth=1.0, alpha=0.9),
+                zorder=10)
+        
+        # Draw arrow annotation covering the range
+        if len(range_9_12_indices) >= 2:
+            arrow_y = max_percentage * 1.15
+            arrow_color = '#2C3E50'
+            arrow_lw = 1.5
+            first_idx = min(range_9_12_indices)
+            last_idx = max(range_9_12_indices)
             
-            # 统一放在柱子上方，使用黑色文字
-            y_pos = height + max_percentage * 0.03  # 放在柱子上方，增加间距
-            text_color = '#2C3E50'  # 黑色文字
-            
-            # 由于图表更长了，可以使用稍大的字体
-            ax.text(bar.get_x() + bar.get_width()/2., y_pos,
-                   f'{percentage:.1f}%',
-                   ha='center', va='bottom', fontsize=7.0, fontweight='bold', 
-                   color=text_color)
+            # Left arrow
+            # ax.annotate('', xy=(first_idx, arrow_y), xytext=(first_idx - 0.5, arrow_y),
+            #             arrowprops=dict(arrowstyle='<-', lw=arrow_lw, color=arrow_color))
+            # Middle line
+            # ax.plot([first_idx, last_idx], [arrow_y, arrow_y], 
+            #         color=arrow_color, linewidth=arrow_lw, linestyle='-', zorder=0)
+            # Right arrow
+            # ax.annotate('', xy=(last_idx, arrow_y), xytext=(last_idx + 0.5, arrow_y),
+            #             arrowprops=dict(arrowstyle='->', lw=arrow_lw, color=arrow_color))
     
     # 设置x轴标签（美化样式）
     # 每个柱子都对应一个横坐标标记
     ax.set_xticks(range(len(bin_labels)))
-    # 根据柱子数量调整字体大小，避免重叠
+    # 根据柱子数量调整字体大小，避免重叠（optimized for single column）
     if len(bin_labels) > 20:
-        fontsize = 6.5
+        fontsize = 8.0
     elif len(bin_labels) > 15:
-        fontsize = 7.0
+        fontsize = 8.5
     else:
-        fontsize = 7.5
+        fontsize = 7.0
     ax.set_xticklabels(bin_labels, fontsize=fontsize, fontweight='bold', rotation=45, ha='right')
     
-    # 设置标签和标题（美化样式，匹配论文格式）
-    ax.set_xlabel('S_max / σ Range', fontsize=9, fontweight='normal', color='#000000')
+    # 设置标签和标题（美化样式，匹配论文格式，optimized for single column）
+    # 使用 LaTeX 数学模式渲染 S_max 和 σ
+    ax.set_xlabel(r'$S_{\max} / \sigma$ Range', fontsize=9, fontweight='normal', color='#000000')
     ax.set_ylabel('Percentage (%)', fontsize=9, fontweight='normal', color='#000000')
     
     # Make y-axis tick labels bold for visibility and format as percentage
     ax.tick_params(axis='y', labelsize=8, colors='#333333', which='major')
-    # 格式化 y 轴刻度标签为百分比
-    yticks = ax.get_yticks()
-    ax.set_yticklabels([f'{y:.1f}%' for y in yticks])
+    # 格式化 y 轴刻度标签为百分比 - 使用 FuncFormatter 避免警告
+    def percentage_formatter(x, pos):
+        return f'{x:.1f}%'
+    ax.yaxis.set_major_formatter(FuncFormatter(percentage_formatter))
     for label in ax.get_yticklabels():
         label.set_fontweight('bold')
     
-    ax.set_title(f'S_max / σ Distribution', 
-                 fontsize=10, fontweight='bold', pad=12, color='#000000')
+    # Adjust y-axis limits to accommodate arrows and annotation
+    if range_9_12_indices:
+        ax.set_ylim(top=max_percentage * 1.5)  # Add extra space at top for arrows and annotation
+    
+    # Removed title as requested
     
     # 添加网格（美化样式，更轻的网格）
     ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, color='#CCCCCC', axis='y', zorder=0)
@@ -184,12 +237,12 @@ def plot_from_json(json_path, output_dir=None):
         spine.set_edgecolor('#D5D5D5')
         spine.set_linewidth(1.0)
     
-    # 使用 tight_layout 并调整边距（为旋转的标签留出更多底部空间）
+    # 使用 tight_layout 并调整边距（为旋转的标签留出更多底部空间，optimized for single column）
     # 由于图表更扁了，需要更多底部空间
     if len(bin_labels) > 15:
-        plt.tight_layout(pad=1.2, rect=[0, 0.12, 1, 1])  # 底部留出更多空间
+        plt.tight_layout(pad=0.8, rect=[0, 0.15, 1, 1])  # 底部留出更多空间
     else:
-        plt.tight_layout(pad=1.2, rect=[0, 0.08, 1, 1])  # 即使柱子不多也留出空间
+        plt.tight_layout(pad=0.8, rect=[0, 0.12, 1, 1])  # 即使柱子不多也留出空间
     
     # 保存图片（高分辨率，适合论文）
     plot_path = output_dir / f'sigma_distribution_{folder_name}.pdf'
@@ -311,11 +364,11 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
         # 如果最大值不超过20，创建到最大值的区间
         bin_max = int(np.ceil(max_val))
         bins = list(range(0, bin_max + 1))
-        bin_labels = [f'{i}-{i+1}' for i in range(bin_max)]
+        bin_labels = [f'{i}' for i in range(bin_max)]
     else:
         # 如果最大值超过20，创建到20的区间，然后20+
         bins = list(range(0, 21)) + [np.inf]
-        bin_labels = [f'{i}-{i+1}' for i in range(20)] + ['20+']
+        bin_labels = [f'{i}' for i in range(20)] + ['20+']
     
     # 按区间统计频数
     counts, bin_edges = np.histogram(num_sigma_array, bins=bins)
@@ -323,10 +376,10 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     # 使用渐变色（viridis colormap，更柔和的颜色）
     colors = plt.cm.viridis(np.linspace(0.25, 0.85, len(bin_labels)))
     
-    # Paper-ready size (调整宽度以适应更多柱子，更扁更长的图表)
+    # Paper-ready size (optimized for single column in Overleaf two-column layout)
     num_bins = len(bin_labels)
-    fig_width = max(7.0, num_bins * 0.35)  # 增加宽度，让图表更长
-    fig_height = 3.2  # 稍微增加高度，为标签留出更多空间
+    fig_width = 3.5  # Single column width in Overleaf
+    fig_height = 2.5  # Adjusted height for single column
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     
     # 计算百分比
@@ -340,53 +393,86 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
                   edgecolor='white', linewidth=1.2, width=bar_width, 
                   zorder=2)  # 确保柱子在网格上方
     
-    # 在柱状图上添加数值标签（美化样式，显示百分比，统一放在柱子上方，黑色文字）
-    # 由于图表更长了，可以显示更多标签
-    threshold = max(percentages) * 0.03  # 只显示大于最大值3%的标签，或者至少0.5%
-    min_threshold = max(0.5, threshold)  # 至少0.5%
+    # Removed percentage labels on bars as requested
     
-    for i, (bar, percentage) in enumerate(zip(bars, percentages)):
-        if percentage > 0 and percentage >= min_threshold:
-            height = bar.get_height()
+    # Calculate total percentage for ranges 9-10, 10-11, 11-12
+    range_9_12_percent = 0.0
+    range_9_12_indices = []
+    for i, label in enumerate(bin_labels):
+        # Check if label matches 9-10, 10-11, or 11-12
+        if label in ['9-10', '10-11', '11-12']:
+            range_9_12_percent += percentages[i]
+            range_9_12_indices.append(i)
+    
+    # Add annotation at the top if we found the ranges
+    if range_9_12_indices:
+        annotation_y = max_percentage * 1.25  # Position above bars
+        stats_text = f'|<--{range_9_12_percent:.1f}%-->|'
+        
+        # Find center position of the range
+        if len(range_9_12_indices) > 0:
+            center_idx = (min(range_9_12_indices) + max(range_9_12_indices)) / 2.0
+        else:
+            center_idx = len(bin_labels) / 2.0
+        
+        # Add annotation at the top center
+        ax.text(center_idx, annotation_y, stats_text,
+                ha='center', va='bottom', fontsize=8, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                        edgecolor='#2C3E50', linewidth=1.0, alpha=0.9),
+                zorder=10)
+        
+        # Draw arrow annotation covering the range
+        if len(range_9_12_indices) >= 2:
+            arrow_y = max_percentage * 1.15
+            arrow_color = '#2C3E50'
+            arrow_lw = 1.5
+            first_idx = min(range_9_12_indices)
+            last_idx = max(range_9_12_indices)
             
-            # 统一放在柱子上方，使用黑色文字
-            y_pos = height + max_percentage * 0.03  # 放在柱子上方，增加间距
-            text_color = '#2C3E50'  # 黑色文字
-            
-            # 由于图表更长了，可以使用稍大的字体
-            ax.text(bar.get_x() + bar.get_width()/2., y_pos,
-                   f'{percentage:.1f}%',
-                   ha='center', va='bottom', fontsize=7.0, fontweight='bold', 
-                   color=text_color)
+            # Left arrow
+            # ax.annotate('', xy=(first_idx, arrow_y), xytext=(first_idx - 0.5, arrow_y),
+            #             arrowprops=dict(arrowstyle='<-', lw=arrow_lw, color=arrow_color))
+            # Middle line
+            # ax.plot([first_idx, last_idx], [arrow_y, arrow_y], 
+            #         color=arrow_color, linewidth=arrow_lw, linestyle='-', zorder=0)
+            # Right arrow
+            # ax.annotate('', xy=(last_idx, arrow_y), xytext=(last_idx + 0.5, arrow_y),
+            #             arrowprops=dict(arrowstyle='->', lw=arrow_lw, color=arrow_color))
     
     # 统计线已移除（Mean 和 Median）
     
     # 设置x轴标签（美化样式）
     # 每个柱子都对应一个横坐标标记
     ax.set_xticks(range(len(bin_labels)))
-    # 根据柱子数量调整字体大小，避免重叠
+    # 根据柱子数量调整字体大小，避免重叠（optimized for single column）
     if len(bin_labels) > 20:
-        fontsize = 6.5
+        fontsize = 6.0
     elif len(bin_labels) > 15:
-        fontsize = 7.0
+        fontsize = 6.5
     else:
-        fontsize = 7.5
+        fontsize = 7.0
     ax.set_xticklabels(bin_labels, fontsize=fontsize, fontweight='bold', rotation=45, ha='right')
     
-    # 设置标签和标题（美化样式，匹配论文格式）
-    ax.set_xlabel('S_max / σ Range', fontsize=9, fontweight='normal', color='#000000')
+    # 设置标签和标题（美化样式，匹配论文格式，optimized for single column）
+    # 使用 LaTeX 数学模式渲染 S_max 和 σ
+    ax.set_xlabel(r'$S_{\max} / \sigma$ Range', fontsize=9, fontweight='normal', color='#000000')
     ax.set_ylabel('Percentage (%)', fontsize=9, fontweight='normal', color='#000000')
     
     # Make y-axis tick labels bold for visibility and format as percentage
     ax.tick_params(axis='y', labelsize=8, colors='#333333', which='major')
-    # 格式化 y 轴刻度标签为百分比
-    yticks = ax.get_yticks()
-    ax.set_yticklabels([f'{y:.1f}%' for y in yticks])
+    # 格式化 y 轴刻度标签为百分比 - 使用 FuncFormatter 避免警告
+    def percentage_formatter(x, pos):
+        return f'{x:.1f}%'
+    ax.yaxis.set_major_formatter(FuncFormatter(percentage_formatter))
     for label in ax.get_yticklabels():
         label.set_fontweight('bold')
     
-    ax.set_title(f'S_max / σ Distribution', 
-                 fontsize=10, fontweight='bold', pad=12, color='#000000')
+    # Adjust y-axis limits to accommodate arrows and annotation
+    if range_9_12_indices:
+        ax.set_ylim(top=max_percentage * 1.5)  # Add extra space at top for arrows and annotation
+    
+    # Removed title as requested
     
     # 添加网格（美化样式，更轻的网格）
     ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, color='#CCCCCC', axis='y', zorder=0)
@@ -403,12 +489,12 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
         spine.set_edgecolor('#D5D5D5')
         spine.set_linewidth(1.0)
     
-    # 使用 tight_layout 并调整边距（为旋转的标签留出更多底部空间）
+    # 使用 tight_layout 并调整边距（为旋转的标签留出更多底部空间，optimized for single column）
     # 由于图表更扁了，需要更多底部空间
     if len(bin_labels) > 15:
-        plt.tight_layout(pad=1.2, rect=[0, 0.12, 1, 1])  # 底部留出更多空间
+        plt.tight_layout(pad=0.8, rect=[0, 0.15, 1, 1])  # 底部留出更多空间
     else:
-        plt.tight_layout(pad=1.2, rect=[0, 0.08, 1, 1])  # 即使柱子不多也留出空间
+        plt.tight_layout(pad=0.8, rect=[0, 0.12, 1, 1])  # 即使柱子不多也留出空间
     
     # 保存图片（高分辨率，适合论文）
     if output_dir is None:

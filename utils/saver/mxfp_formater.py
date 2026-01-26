@@ -4,6 +4,12 @@ from enum import Enum, IntEnum
 import numpy as np
 import json
 from pathlib import Path
+import matplotlib.pyplot as plt
+
+# Set global font to Times New Roman (or Calibri as fallback) for paper-ready plots
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman', 'Calibri', 'DejaVu Serif']
+plt.rcParams['mathtext.fontset'] = 'stix'  # Use STIX fonts for math text
 
 
 FP32_EXPONENT_BIAS = 127
@@ -1195,6 +1201,8 @@ def _quantize_mx_with_statistics(
         
     Returns:
         tuple: (quantized_tensor, distribution_stats)
+        distribution_stats includes 'pre_scaling' and 'post_scaling' keys with statistics and sampled data
+        about values before and after scaling, including count and percentage of values with |value| > 6
     """
     if elem_format == None:
         return A, {}
@@ -1227,7 +1235,62 @@ def _quantize_mx_with_statistics(
     shared_exp[shared_exp > scale_emax] = float("NaN")
     shared_exp[shared_exp < -scale_emax] = -scale_emax
     
+    # Collect data before scaling
+    pre_scaling_stats = {}
+    pre_scaling_data = None
+    if target_values is not None:
+        # Flatten tensor for analysis (before scaling)
+        A_before_flat = A.detach().cpu().float().flatten().numpy()
+        
+        # Filter outliers (|value| > 6) for analysis
+        mask_before = np.abs(A_before_flat) <= 6.0
+        A_before_filtered = A_before_flat[mask_before]
+        outliers_count_before = np.sum(~mask_before)
+        total_count_before = len(A_before_flat)
+        
+        # Calculate statistics (use full data for min/max, filtered data for mean/std/median)
+        pre_scaling_stats = {
+            'total_elements': int(total_count_before),
+            'outliers_6plus_count': int(outliers_count_before),
+            'outliers_6plus_percent': float(outliers_count_before / total_count_before * 100) if total_count_before > 0 else 0.0,
+            'filtered_elements': int(len(A_before_filtered)),
+            'min': float(np.min(A_before_flat)) if len(A_before_flat) > 0 else 0.0,  # Use full data for min
+            'max': float(np.max(A_before_flat)) if len(A_before_flat) > 0 else 0.0,  # Use full data for max
+            'mean': float(np.mean(A_before_filtered)) if len(A_before_filtered) > 0 else 0.0,
+            'std': float(np.std(A_before_filtered)) if len(A_before_filtered) > 0 else 0.0,
+            'median': float(np.median(A_before_filtered)) if len(A_before_filtered) > 0 else 0.0
+        }
+        
+        # Store pre-scaling data for later plotting (use full data, not filtered)
+        # Sample to save memory
+        max_samples = min(100000, len(A_before_flat))
+        if len(A_before_flat) > max_samples:
+            indices = np.random.choice(len(A_before_flat), size=max_samples, replace=False)
+            pre_scaling_data = A_before_flat[indices]
+        else:
+            pre_scaling_data = A_before_flat.copy() if len(A_before_flat) > 0 else None
+    
+    # Apply scaling
     A = A / (2**shared_exp)
+    
+    # Collect data after scaling
+    post_scaling_data = None
+    if target_values is not None:
+        # Flatten tensor for analysis (after scaling)
+        A_after_flat = A.detach().cpu().float().flatten().numpy()
+        
+        # Filter outliers (|value| > 6) for analysis
+        mask_after = np.abs(A_after_flat) <= 6.0
+        A_after_filtered = A_after_flat[mask_after]
+        
+        # Store post-scaling data for aggregation (sample to save memory)
+        # Sample at most 100k points to avoid memory issues
+        max_samples = min(100000, len(A_after_filtered))
+        if len(A_after_filtered) > max_samples:
+            indices = np.random.choice(len(A_after_filtered), size=max_samples, replace=False)
+            post_scaling_data = A_after_filtered[indices]
+        else:
+            post_scaling_data = A_after_filtered.copy() if len(A_after_filtered) > 0 else None
     
     # Quantize - this is where we want to capture the distribution
     A_quantized = _quantize_elemwise_core(
@@ -1241,6 +1304,20 @@ def _quantize_mx_with_statistics(
         distribution_stats = analyze_quantized_value_distribution(
             A_quantized, target_values, tolerance=1e-5
         )
+        # Add pre-scaling statistics and data
+        distribution_stats['pre_scaling'] = pre_scaling_stats
+        # Add sampled data for aggregation (convert to list for JSON serialization)
+        if pre_scaling_data is not None:
+            # Sample to save memory
+            max_samples = min(100000, len(pre_scaling_data))
+            if len(pre_scaling_data) > max_samples:
+                indices = np.random.choice(len(pre_scaling_data), size=max_samples, replace=False)
+                pre_scaling_data_sampled = pre_scaling_data[indices].tolist()
+            else:
+                pre_scaling_data_sampled = pre_scaling_data.tolist()
+            distribution_stats['pre_scaling']['data'] = pre_scaling_data_sampled
+        if post_scaling_data is not None:
+            distribution_stats['post_scaling'] = {'data': post_scaling_data.tolist()}
     
     # Scale back
     A_quantized = A_quantized * (2**shared_exp)
@@ -1321,6 +1398,7 @@ def _process_single_tensor(tensor_file, minus_exp, elem_format, scale_bits, bloc
         
     Returns:
         dict: Result dictionary with 'success', 'distribution', 'tensor_file', 'error', etc.
+        distribution includes 'pre_scaling' and 'post_scaling' with sampled data for aggregation
     """
     result = {
         'success': False,
@@ -1473,13 +1551,15 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
             successful_count = result_data['successful_count']
             
             # Prepare data for plotting
-            # Convert keys to float for sorting, but keep original string keys for access
-            # Sort by float value but use original string keys
-            key_value_pairs = [(float(k), k) for k in aggregated_dist.keys()]
+            # Filter out non-numeric keys first
+            numeric_keys = [k for k in aggregated_dist.keys() if isinstance(k, (int, float))]
+            # Convert keys to float for sorting, but keep original keys for access
+            # Sort by float value but use original keys for access
+            key_value_pairs = [(float(k), k) for k in numeric_keys]
             key_value_pairs.sort(key=lambda x: x[0])  # Sort by float value
             
             sorted_values = [v for v, _ in key_value_pairs]  # Float values for labels
-            sorted_keys = [k for _, k in key_value_pairs]    # Original string keys for access
+            sorted_keys = [k for _, k in key_value_pairs]    # Original keys for access
             
             percentages = [aggregated_dist[k]['avg_percent'] for k in sorted_keys]
             std_percentages = [aggregated_dist[k].get('std_percent', 0) for k in sorted_keys]
@@ -1556,6 +1636,12 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
     # Process each minus_exp value
     all_results = {}
     
+    # Collect scaling data for aggregation (use first minus_exp)
+    all_pre_scaling_data = []
+    all_post_scaling_data = []
+    all_quantized_distributions = []  # Collect quantized value distributions for bar chart
+    scaling_data_collected = False
+    
     for minus_exp in minus_exp_list:
         print(f"\n{'='*60}")
         print(f"Processing minus_exp = {minus_exp}")
@@ -1590,6 +1676,19 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
                         successful_count += 1
                         pbar.set_postfix({'success': successful_count, 
                                         'file': result['tensor_name'][:30]})
+                        
+                        # Collect scaling data for aggregation (only for first minus_exp to avoid duplication)
+                        if not scaling_data_collected and result['distribution']:
+                            dist = result['distribution']
+                            if 'pre_scaling' in dist and 'data' in dist['pre_scaling']:
+                                all_pre_scaling_data.extend(dist['pre_scaling']['data'])
+                            if 'post_scaling' in dist and 'data' in dist['post_scaling']:
+                                all_post_scaling_data.extend(dist['post_scaling']['data'])
+                            # Collect quantized distribution (exclude 'pre_scaling' and 'post_scaling' keys)
+                            quantized_dist = {k: v for k, v in dist.items() 
+                                            if isinstance(k, (int, float)) and k not in ['pre_scaling', 'post_scaling']}
+                            if quantized_dist:
+                                all_quantized_distributions.append(quantized_dist)
                     else:
                         if result['error']:
                             print(f"  ⚠️  {result['tensor_name']}: {result['error']}")
@@ -1605,10 +1704,20 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
         
         print(f"\nSuccessfully processed {successful_count}/{len(tensor_files)} tensors for minus_exp={minus_exp}")
         
+        # Mark scaling data as collected after first minus_exp
+        if not scaling_data_collected:
+            scaling_data_collected = True
+        
         # Aggregate statistics
         aggregated_dist = {}
         for dist in all_distributions:
             for value, stats in dist.items():
+                # Skip non-numeric keys like 'pre_quantization'
+                if not isinstance(value, (int, float)):
+                    continue
+                # Skip if stats doesn't have 'count' key (shouldn't happen, but safety check)
+                if not isinstance(stats, dict) or 'count' not in stats:
+                    continue
                 if value not in aggregated_dist:
                     aggregated_dist[value] = {'count': 0, 'percent': []}
                 aggregated_dist[value]['count'] += stats['count']
@@ -1626,7 +1735,9 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
         }
         
         # Prepare data for plotting
-        sorted_values = sorted(aggregated_dist.keys())
+        # Filter out non-numeric keys (safety check)
+        numeric_keys = [k for k in aggregated_dist.keys() if isinstance(k, (int, float))]
+        sorted_values = sorted(numeric_keys)
         percentages = [aggregated_dist[v]['avg_percent'] for v in sorted_values]
         std_percentages = [aggregated_dist[v].get('std_percent', 0) for v in sorted_values]
         labels = [f'{v:+.1f}' if v != 0 else '0' for v in sorted_values]
@@ -1782,7 +1893,9 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
     
     # 绘制zeroing loss占比最大的tensor的分布图
     distribution = max_zeroing_loss_data['distribution']
-    sorted_values = sorted(distribution.keys())
+    # Filter out non-numeric keys (like 'pre_scaling')
+    numeric_keys = [k for k in distribution.keys() if isinstance(k, (int, float))]
+    sorted_values = sorted(numeric_keys)
     percentages = [distribution[v]['percent'] for v in sorted_values]
     labels = [f'{v:+.1f}' if v != 0 else '0' for v in sorted_values]
     
@@ -1945,6 +2058,264 @@ def analyze_folder_value_distribution(folder_path, elem_format='fp4_e2m1',
     
     print(f"\n✅ Comparison plot saved to: {comparison_plot_path}")
     print("=" * 60)
+    
+    # Aggregate and plot scaling distribution (pre and post scaling)
+    print("\n" + "=" * 60)
+    print("Creating aggregated scaling distribution plot...")
+    print("=" * 60)
+    
+    # Create aggregated scaling distribution plot using collected data
+    if len(all_pre_scaling_data) > 0 and len(all_quantized_distributions) > 0:
+            try:
+                # Convert to numpy arrays
+                pre_data = np.array(all_pre_scaling_data)
+                
+                # Aggregate quantized distributions
+                # Sum counts across all tensors, then calculate total percentage
+                total_count = 0
+                aggregated_quantized_dist = {}
+                for dist in all_quantized_distributions:
+                    for value, stats in dist.items():
+                        if value not in aggregated_quantized_dist:
+                            aggregated_quantized_dist[value] = {'count': 0}
+                        aggregated_quantized_dist[value]['count'] += stats.get('count', 0)
+                        total_count += stats.get('count', 0)
+                
+                # Calculate percentages based on total count
+                if total_count > 0:
+                    for value in aggregated_quantized_dist:
+                        aggregated_quantized_dist[value]['percent'] = (aggregated_quantized_dist[value]['count'] / total_count) * 100
+                
+                # Create two separate figures instead of subplots
+                
+                # ========== Figure 1: Before Scaling ==========
+                # Size optimized for single column in Overleaf two-column layout (width ~3.5 inches)
+                # Font: Times New Roman/Calibri (set globally via plt.rcParams)
+                fig1, ax1 = plt.subplots(1, 1, figsize=(3.5, 2.5))
+                
+                # Plot pre-scaling distribution - histogram
+                n_bins_pre = min(200, max(50, int(np.sqrt(len(pre_data)))))
+                if len(pre_data) > 0:
+                    counts, bins, patches = ax1.hist(pre_data, bins=n_bins_pre, alpha=0.7, 
+                            color='#1f77b4', density=True,
+                            linewidth=0.3, edgecolor='black')
+                    
+                    # Add zero reference line
+                    if np.min(pre_data) < 0 < np.max(pre_data):
+                        ax1.axvline(0, color='gray', linestyle='-', linewidth=0.8, alpha=0.5, label='Zero')
+                    
+                    # Set labels and styling (using Times New Roman/Calibri from global settings)
+                    ax1.set_xlabel('Value', fontsize=12, fontweight='normal')
+                    ax1.set_ylabel('Density', fontsize=12, fontweight='normal')
+                    ax1.tick_params(axis='both', which='major', labelsize=12)
+                    ax1.tick_params(axis='both', which='minor', labelsize=11)
+                    ax1.grid(True, alpha=0.25, linewidth=0.5)
+                    # ax1.set_title('Before Scaling', fontsize=13, fontweight='normal')
+                    # Don't clip x-axis - let it show full range
+                    
+                    # Mark minimum and maximum values above x-axis (after setting labels to get proper y-axis range)
+                    data_min = np.min(pre_data)
+                    data_max = np.max(pre_data)
+                    
+                    # Get y-axis limits to position markers above the axis
+                    y_min_axis, y_max_axis = ax1.get_ylim()
+                    # Position markers slightly above the x-axis (about 2% of y-axis range)
+                    y_marker_pos = y_min_axis + (y_max_axis - y_min_axis) * 0.05
+                    
+                    # Mark minimum with blue downward triangle
+                    ax1.plot(data_min, y_marker_pos, marker='v', markersize=9, color='blue', 
+                             markeredgecolor='darkblue', markeredgewidth=2, zorder=10, label='Min')
+                    
+                    # Mark maximum with red upward triangle
+                    ax1.plot(data_max, y_marker_pos, marker='^', markersize=9, color='red', 
+                             markeredgecolor='darkred', markeredgewidth=2, zorder=10, label='Max')
+                    
+                    # Add legend after markers (using Times New Roman/Calibri from global settings)
+                    ax1.legend(fontsize=10, framealpha=0.9)
+                
+                # Improve layout and save first plot
+                fig1.tight_layout(pad=1.0)
+                fig1.patch.set_facecolor('white')
+                
+                scaling_plot_path_before = output_dir / f'scaling_distribution_before_{elem_format}_{folder_path.name}.pdf'
+                fig1.savefig(scaling_plot_path_before, dpi=600, bbox_inches='tight', pad_inches=0.05, 
+                           facecolor='white', edgecolor='none')
+                plt.close(fig1)
+                
+                print(f"\n✅ Before scaling distribution plot saved to: {scaling_plot_path_before}")
+                
+                # ========== Figure 2: After Scaling ==========
+                if aggregated_quantized_dist:
+                    # Optimized for single column display in Overleaf (double column layout)
+                    fig2, ax2 = plt.subplots(1, 1, figsize=(3.5, 2.0))
+                    
+                    # Filter out non-numeric keys and sort (show all values)
+                    numeric_keys = [k for k in aggregated_quantized_dist.keys() if isinstance(k, (int, float))]
+                    sorted_values = sorted(numeric_keys)
+                    percentages = [aggregated_quantized_dist[v]['percent'] for v in sorted_values]
+                    
+                    # Create labels: show all values on x-axis (preserve decimals)
+                    def format_value(val):
+                        """Format value, preserving decimals if needed"""
+                        if abs(float(val)) < 1e-6:
+                            return '0'
+                        # Check if value is effectively an integer
+                        if abs(float(val) - round(float(val))) < 1e-6:
+                            return f'{int(round(val)):+d}' if val != 0 else '0'
+                        else:
+                            # Has decimal part, show with 1 decimal place
+                            return f'{val:+.1f}'
+                    
+                    labels = [format_value(v) for v in sorted_values]
+                    
+                    # Calculate statistics for three ranges: < -3, [-3, 3], > 3
+                    range_less_neg3_percent = 0.0
+                    range_neg3_to_3_percent = 0.0
+                    range_greater_3_percent = 0.0
+                    range_less_neg3_indices = []
+                    range_neg3_to_3_indices = []
+                    range_greater_3_indices = []
+                    
+                    for i, val in enumerate(sorted_values):
+                        val_float = float(val)
+                        if val_float < -3.0:
+                            range_less_neg3_percent += percentages[i]
+                            range_less_neg3_indices.append(i)
+                        elif -3.0 <= val_float <= 3.0:
+                            range_neg3_to_3_percent += percentages[i]
+                            range_neg3_to_3_indices.append(i)
+                        else:  # val_float > 3.0
+                            range_greater_3_percent += percentages[i]
+                            range_greater_3_indices.append(i)
+                    
+                    # Use gradient colors from a single color scheme
+                    colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(sorted_values)))
+                    
+                    # Create bar plot (show all values)
+                    bars = ax2.bar(range(len(sorted_values)), percentages, 
+                                  color=colors, alpha=0.8, edgecolor='white', linewidth=1.5)
+                    
+                    # Calculate y_max once for positioning annotations
+                    y_max = max(percentages) if percentages else 0
+                    annotation_y = y_max * 1.25  # Position above bars
+                    
+                    # Create three-segment annotation with vertical separators
+                    # Format: |<---X.X%-->|<---X.X%--->|<---X.X%-->|
+                    stats_text = f'|<-{range_less_neg3_percent:.1f}%->|<---------------{range_neg3_to_3_percent:.1f}%--------------->|<-{range_greater_3_percent:.1f}%->|'
+                    
+                    # Add annotation at the top center
+                    ax2.text(len(sorted_values) / 2.0 - 0.5, annotation_y, stats_text,
+                            ha='center', va='bottom', fontsize=9, fontweight='bold',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                                    edgecolor='#2C3E50', linewidth=1.0, alpha=0.9),
+                            zorder=10)
+                    
+                    # Draw unified arrow from -6 to 6 with vertical separators at -6, -3, 3, 6
+                    arrow_y = y_max * 1.15
+                    arrow_color = '#2C3E50'
+                    arrow_lw = 1.5
+                    
+                    # Find indices for -6, -3, 3, 6 (these are the x-coordinates of bar centers)
+                    # Use first occurrence for -6 and last occurrence for 6 to cover the full range
+                    idx_neg6_first = None
+                    idx_neg6_last = None
+                    idx_neg3 = None
+                    idx_3 = None
+                    idx_6_first = None
+                    idx_6_last = None
+                    
+                    for i, val in enumerate(sorted_values):
+                        val_float = float(val)
+                        if abs(val_float + 6.0) < 1e-6:
+                            if idx_neg6_first is None:
+                                idx_neg6_first = i
+                            idx_neg6_last = i
+                        elif abs(val_float + 4.0) < 1e-6:
+                            idx_neg3 = i
+                        elif abs(val_float - 4.0) < 1e-6:
+                            idx_3 = i
+                        elif abs(val_float - 6.0) < 1e-6:
+                            if idx_6_first is None:
+                                idx_6_first = i
+                            idx_6_last = i
+                    
+                    # Use first -6 and last 6 to cover the full range
+                    idx_neg6 = idx_neg6_first if idx_neg6_first is not None else idx_neg6_last
+                    idx_6 = idx_6_last if idx_6_last is not None else idx_6_first
+                    
+                    # Draw unified arrow from -6 to 6 (using exact bar center positions)
+                    if idx_neg6 is not None and idx_6 is not None:
+                        # Left arrow at first -6 (pointing right, starting from bar center)
+                        ax2.annotate('', xy=(idx_neg6, arrow_y), xytext=(idx_neg6 - 0.5, arrow_y),
+                                    arrowprops=dict(arrowstyle='-', lw=arrow_lw, color=arrow_color))
+                        # Middle line from first -6 to last 6 (exact bar center to bar center)
+                        ax2.plot([idx_neg6, idx_6], [arrow_y, arrow_y], 
+                                color=arrow_color, linewidth=arrow_lw, linestyle='-', zorder=0)
+                        # Right arrow at last 6 (pointing left, ending at bar center)
+                        ax2.annotate('', xy=(idx_6, arrow_y), xytext=(idx_6 + 0.5, arrow_y),
+                                    arrowprops=dict(arrowstyle='-', lw=arrow_lw, color=arrow_color))
+                    
+                    # Draw vertical separators at -6, -3, 3, 6 (aligned exactly with bar centers)
+                    # Use the first occurrence of -6 and last occurrence of 6 for separators
+                    separator_bottom = y_max * 1.05  # Just above the highest bar
+                    separator_top = arrow_y + 0.2     # Just above the arrow line
+                    
+                    # Draw separator at first -6
+                    if idx_neg6_first is not None:
+                        ax2.plot([idx_neg6_first, idx_neg6_first], [separator_bottom, separator_top], 
+                                color=arrow_color, linewidth=arrow_lw, zorder=0)
+                    # Draw separator at -3
+                    if idx_neg3 is not None:
+                        ax2.plot([idx_neg3, idx_neg3], [separator_bottom, separator_top], 
+                                color=arrow_color, linewidth=arrow_lw, zorder=0)
+                    # Draw separator at 3
+                    if idx_3 is not None:
+                        ax2.plot([idx_3, idx_3], [separator_bottom, separator_top], 
+                                color=arrow_color, linewidth=arrow_lw, zorder=0)
+                    # Draw separator at last 6
+                    if idx_6_last is not None:
+                        ax2.plot([idx_6_last, idx_6_last], [separator_bottom, separator_top], 
+                                color=arrow_color, linewidth=arrow_lw, zorder=0)
+                    
+                    # Styling optimized for single column display in Overleaf
+                    ax2.set_xlabel('Quantized Values', fontsize=10, fontweight='normal')
+                    ax2.set_ylabel('Percentage (%)', fontsize=10, fontweight='normal')
+                    ax2.set_xticks(range(len(sorted_values)))
+                    # Show all values on x-axis, slight rotation to prevent overlap
+                    ax2.set_xticklabels(labels, fontsize=9, fontweight='bold', rotation=30, ha='right')
+                    # Remove title as requested
+                    # ax2.set_title('After Scaling', fontsize=15, fontweight='normal')
+                    # Set tick labels for both axes (optimized for Overleaf paper)
+                    ax2.tick_params(axis='both', which='major', labelsize=9)
+                    ax2.tick_params(axis='both', which='minor', labelsize=8)
+                    # Make y-axis tick labels bold
+                    for label in ax2.get_yticklabels():
+                        label.set_fontweight('bold')
+                    
+                    # Adjust y-axis limits to accommodate arrows and annotation
+                    ax2.set_ylim(top=y_max * 1.5)  # Add extra space at top for arrows and annotation
+                    
+                    # Grid
+                    ax2.grid(True, alpha=0.25, linestyle='--', linewidth=0.5, axis='y')
+                    ax2.set_axisbelow(True)
+                    
+                    # Background
+                    ax2.set_facecolor('#F8F9FA')
+                    
+                    # Improve layout and save second plot (optimized for single column)
+                    fig2.tight_layout(pad=0.5)
+                    fig2.patch.set_facecolor('white')
+                    
+                    scaling_plot_path_after = output_dir / f'scaling_distribution_after_{elem_format}_{folder_path.name}.pdf'
+                    fig2.savefig(scaling_plot_path_after, dpi=600, bbox_inches='tight', pad_inches=0.02, 
+                               facecolor='white', edgecolor='none')
+                    plt.close(fig2)
+                    
+                    print(f"✅ After scaling distribution plot saved to: {scaling_plot_path_after}")
+            except Exception as e:
+                print(f"Warning: Failed to create aggregated scaling distribution plot: {e}")
+                import traceback
+                traceback.print_exc()
     
     return all_results
 
