@@ -2,6 +2,39 @@ import torch
 from .ops.mxfp import _quantize_mx
 from .ops.hifp import quant_hif8
 from .ops.nvfp import quant_nvfp
+import os
+
+# --- 全局配置 ---
+class DebugSaverConfig:
+    ENABLE = True                  # 总开关
+    CURRENT_ITER = 0               # 当前 iter (需要在训练循环里手动更新)
+    TARGET_ITERS = [700,1000]        # 需要保存的 iter
+    SAVE_DIR = "./tensors_Olmo7B"   # 相对路径
+    SAVE_COUNTER = 0
+
+def _simple_save(tensor, prefix):
+    """
+    自动创建 iter 文件夹，并以 '前缀_内存地址.pt' 格式保存
+    """
+    try:
+        rank = int(os.environ.get("RANK", 0))
+    except ValueError:
+        rank = 0
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+
+    if rank == 0 and DebugSaverConfig.ENABLE and (DebugSaverConfig.CURRENT_ITER in DebugSaverConfig.TARGET_ITERS):
+        iter_dir = os.path.join(DebugSaverConfig.SAVE_DIR, str(DebugSaverConfig.CURRENT_ITER))
+        if not os.path.exists(iter_dir):
+            os.makedirs(iter_dir, exist_ok=True)
+        
+        # 例如：fwd_in_12345.pt
+        filename = f"{prefix}_{DebugSaverConfig.SAVE_COUNTER}.pt"
+        
+        filepath = os.path.join(iter_dir, filename)
+        torch.save(tensor.clone(), filepath)
+        
+        DebugSaverConfig.SAVE_COUNTER += 1
 
 def _convert_format_to_internal(forward_format):
     """
@@ -25,9 +58,8 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
     def forward(ctx, tensor, forward_format='mxfp8_e4m3', minus_exp=None, 
                 backward_quantize=True, backward_format='mxfp8_e4m3'):
         scale_bits = 8
-        # from utils.saver.tensor_saver import _simple_save
         tensor_temp = tensor.clone() 
-        # _simple_save(tensor_temp, "fwd_in")   
+        _simple_save(tensor_temp, "fwd_in")   
         # Forward 量化
         if forward_format in ['mxfp8_e4m3', 'mxfp8_e5m2','mxfp4_e2m1']:
             # Convert format name from external API to internal format
@@ -60,11 +92,11 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
         
         # STE: 允许梯度流回原 tensor，但使用量化后的值进行计算
         final_tensor = tensor + (tensor_temp - tensor.detach())
-        
         return final_tensor
     
     @staticmethod
     def backward(ctx, grad_output):
+        _simple_save(grad_output, "bwd_grad")
         if ctx.backward_quantize and ctx.backward_format:
             # 量化梯度
             scale_bits = 8
@@ -103,6 +135,7 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
             return grad_output, None, None, None, None
 
 
+# 恢复原样，不需要 name 参数
 def quant_dequant_tensor_with_backward(tensor, forward_format='mxfp8_e4m3', 
                                        minus_exp=None, 
                                        backward_quantize=True,
@@ -111,15 +144,12 @@ def quant_dequant_tensor_with_backward(tensor, forward_format='mxfp8_e4m3',
         tensor, forward_format, minus_exp, backward_quantize, backward_format
     )
 
+# 恢复原样，不需要 name 参数
 def quant_dequant_qkv(q,k,v,minus_exp=None, forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3'):
-    """
-    Quantize and dequantize Q, K, V tensors with backward quantization support.
-    Returns tensors converted to bfloat16, matching the original implementation.
-    """
     q = quant_dequant_tensor_with_backward(q, forward_format, minus_exp, backward_quantize, backward_format)
     k = quant_dequant_tensor_with_backward(k, forward_format, minus_exp, backward_quantize, backward_format)
     v = quant_dequant_tensor_with_backward(v, forward_format, minus_exp, backward_quantize, backward_format)
-    # Convert to bfloat16 to match original implementation behavior
+    
     q = q.to(torch.bfloat16)
     k = k.to(torch.bfloat16)
     v = v.to(torch.bfloat16)
