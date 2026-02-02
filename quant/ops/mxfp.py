@@ -241,18 +241,18 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
 
     # log2(shared_exp) and truncate to integer
     if minus_exp is not None:
-        # if minus_exp == "auto-fix":
-        #     shared_exp = torch.floor(
-        #         torch.log2(
-        #             shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
-        #         )
-        #     )
-        # else:
-        shared_exp = torch.ceil(
-            torch.log2(
-                shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+        if minus_exp == "auto-fix":
+            shared_exp = torch.floor(
+                torch.log2(
+                    shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+                )
             )
-        )
+        else:
+            shared_exp = torch.ceil(
+                torch.log2(
+                    shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+                )
+            )
         if isinstance(minus_exp, str) and "auto" in minus_exp:
             if minus_exp == "auto":     
                 minus_exp_result = calculate_minus_mse_exp(
@@ -261,7 +261,7 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
                     round="nearest", flush_fp32_subnorms=False,minus_level=minus_level
                 )
             elif minus_exp == "auto-fix":
-                minus_exp_result = calculate_minus_mse_exp_sigfma(
+                minus_exp_result = calculate_minus_mse_exp_sigma(
                     A, scale_bits=8, elem_format=elem_format, 
                     shared_exp_method=method, axes=axes, block_size=32, 
                     round="nearest", flush_fp32_subnorms=False,minus_level=minus_level
@@ -645,7 +645,7 @@ def calculate_minus_mse_exp(
     
     return best_minus_exp_per_block
 
-def calculate_minus_mse_exp_sigfma(
+def calculate_minus_mse_exp_sigma(
     A,
     scale_bits,
     elem_format,
@@ -748,7 +748,7 @@ def calculate_minus_mse_exp_sigfma(
         # Choose the one closer to threshold
         dist_max = torch.abs(max_per_block - threshold)
         dist_max_half = torch.abs(max_per_block / 2.0 - threshold)
-        use_half = dist_max_half > dist_max
+        use_half = dist_max_half < dist_max
         
         # Ensure use_half has the same shape as shared_exp
         if use_half.shape != shared_exp.shape:
