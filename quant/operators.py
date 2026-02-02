@@ -8,10 +8,10 @@ import os
 class DebugSaverConfig:
     ENABLE = True                  # 总开关
     CURRENT_ITER = 0               # 当前 iter (需要在训练循环里手动更新)
-    TARGET_ITERS = [2, 6]        # 需要保存的 iter
+    TARGET_ITERS = [501,701,1001]        # 需要保存的 iter
     SAVE_DIR = "./newtensors_Olmo1B"   # 相对路径
     SAVE_COUNTER = 0
-    MIN_SIZE_MB = 5
+    MIN_SIZE_MB = 7
 
 def _simple_save(tensor, prefix, name=None):
     """
@@ -24,14 +24,10 @@ def _simple_save(tensor, prefix, name=None):
         return
 
     # 分布式 rank 检查
-    rank = "Unknown"
+    rank = 0
     if torch.distributed.is_initialized():
         rank = torch.distributed.get_rank()
-    
-    # 打印当前尝试保存的进程信息
-    print(f"[DebugSaver] Rank: {rank}, PID: {os.getpid()} is entering save function.")
-    
-    if rank != 0 and rank != "Unknown":
+    if rank != 0:
         return
 
     # --- 过滤逻辑 ---
