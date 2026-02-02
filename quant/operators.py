@@ -8,10 +8,10 @@ import os
 class DebugSaverConfig:
     ENABLE = True                  # 总开关
     CURRENT_ITER = 0               # 当前 iter (需要在训练循环里手动更新)
-    TARGET_ITERS = [500,700,1000]        # 需要保存的 iter
+    TARGET_ITERS = [2, 6]        # 需要保存的 iter
     SAVE_DIR = "./newtensors_Olmo1B"   # 相对路径
     SAVE_COUNTER = 0
-    MIN_SIZE_MB = 10
+    MIN_SIZE_MB = 5
 
 def _simple_save(tensor, prefix, name=None):
     """
@@ -24,10 +24,14 @@ def _simple_save(tensor, prefix, name=None):
         return
 
     # 分布式 rank 检查
-    rank = 0
+    rank = "Unknown"
     if torch.distributed.is_initialized():
         rank = torch.distributed.get_rank()
-    if rank != 0:
+    
+    # 打印当前尝试保存的进程信息
+    print(f"[DebugSaver] Rank: {rank}, PID: {os.getpid()} is entering save function.")
+    
+    if rank != 0 and rank != "Unknown":
         return
 
     # --- 过滤逻辑 ---
@@ -75,7 +79,8 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
     def forward(ctx, tensor, forward_format='mxfp8_e4m3', minus_exp=None, 
                 backward_quantize=True, backward_format='mxfp8_e4m3', name=None):
 
-        _simple_save(tensor, "fwd_in", name=name)
+        if tensor.requires_grad: 
+            _simple_save(tensor, "fwd_in", name=name)
 
         scale_bits = 8
         tensor_temp = tensor.clone()   
