@@ -48,6 +48,8 @@ if __name__ == '__main__':
 
     print("origin_A:", A)
     print("mxfp8_A:", mxfp8)
+    loss_A = torch.mean((A - mxfp8) ** 2)
+    print(f"loss_A:{loss_A.item()}")
     
     print(f"A_shape:{A.shape},grad_max:{torch.max(A)},grad_min:{torch.min(A)}")
     B = torch.randn(1024, 1024).npu()
@@ -58,4 +60,4 @@ if __name__ == '__main__':
     loss_mxfp = torch.mean((C_bf16 - C_mxfp8) ** 2)
         
     print(f"C_shape:{C_mxfp8.shape},output_max:{torch.max(C_mxfp8)},output_min:{torch.min(C_mxfp8)}")
-    print(f"loss_mxfp:{loss_mxfp}")
+    print(f"loss_mxfp:{loss_mxfp.item()}")

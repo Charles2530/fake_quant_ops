@@ -920,5 +920,5 @@ if __name__ == '__main__':
             C_mxfp8 = mxfp_matmul(A, B, elem_format='fp4_e2m1', block_size=block_size, minus_exp=minus_exp, heuristic_level=level)
             C_bf16 = torch.matmul(A,B).to(torch.bfloat16)
             loss_mxfp = torch.mean((C_bf16 - C_mxfp8) ** 2)
-            print(f"loss_mxfp: {loss_mxfp}")
+            print(f"loss_mxfp: {loss_mxfp.item()}")
             print("-" * 30)
