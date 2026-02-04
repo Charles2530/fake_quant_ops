@@ -322,8 +322,7 @@ def analyze_folder(folder_path, output_dir=None, num_workers=32):
     # 计算统计量
     min_num_sigma = np.min(num_sigma_array)
     max_num_sigma = np.max(num_sigma_array)
-    # avg_num_sigma = np.mean(num_sigma_array)
-    avg_num_sigma = 10.1082
+    avg_num_sigma = np.mean(num_sigma_array)
     median_num_sigma = np.median(num_sigma_array)
     std_num_sigma = np.std(num_sigma_array)
     p25_num_sigma = np.percentile(num_sigma_array, 25)

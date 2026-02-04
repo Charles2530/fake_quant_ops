@@ -9,7 +9,7 @@ class DebugSaverConfig:
     ENABLE = True                  # 总开关
     CURRENT_ITER = 0               # 当前 iter (需要在训练循环里手动更新)
     TARGET_ITERS = [501,701,1001]        # 需要保存的 iter
-    SAVE_DIR = "./newtensors_Olmo1B"   # 相对路径
+    SAVE_DIR = "./newtensors_Olmo7B"   # 相对路径
     SAVE_COUNTER = 0
     MIN_SIZE_MB = 7
 
