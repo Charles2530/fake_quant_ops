@@ -3,7 +3,6 @@ import torch_npu
 import sys,os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.quant_compute.quant_cy_npu.quant_cy_npu import quant_dequant_float,QType
-from utils.quant_compute.quant_cy_npu.mxfp8 import injectMatmulNora
 
 def quant_dequant_qkv(q,k,v):
     q_temp,k_temp,v_temp = q.clone(),k.clone(),v.clone()
