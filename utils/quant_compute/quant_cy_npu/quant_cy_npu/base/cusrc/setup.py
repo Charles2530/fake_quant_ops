@@ -10,15 +10,16 @@ ascend_toolkit_install_path='/usr/local/Ascend/ascend-toolkit/latest'
 
 pytorch_extension_name = 'npu_quant'
 pytorch_interface_cpp_files = ['npu_quant.cpp']
+platform = 'x86_64' # x86_64 or aarch64
 
 
 # build ascend op
 ascend_include_paths=[
-    ascend_toolkit_install_path + '/aarch64-linux/tikcpp/tikcfw/',
-    ascend_toolkit_install_path + '/aarch64-linux/tikcpp/tikcfw/interface',
-    ascend_toolkit_install_path + '/aarch64-linux/tikcpp/tikcfw/impl',
-    ascend_toolkit_install_path + '/aarch64-linux/tikcpp/tikcfw/kernel_tiling',
-    ascend_toolkit_install_path + '/aarch64-linux/tikcpp/tikcfw/op_frame',
+    ascend_toolkit_install_path + f'/{platform}-linux/tikcpp/tikcfw/',
+    ascend_toolkit_install_path + f'/{platform}-linux/tikcpp/tikcfw/interface',
+    ascend_toolkit_install_path + f'/{platform}-linux/tikcpp/tikcfw/impl',
+    ascend_toolkit_install_path + f'/{platform}-linux/tikcpp/tikcfw/kernel_tiling',
+    ascend_toolkit_install_path + f'/{platform}-linux/tikcpp/tikcfw/op_frame',
 ]
 ascend_libraries = ['runtime', 'ascendcl']
 ascend_library_paths = [

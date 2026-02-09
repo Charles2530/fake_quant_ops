@@ -23,31 +23,32 @@ MODEL_CONFIGS = {
         'data_dir': 'logs/OLMo-7b',
         'output_dir': 'logs/OLMo-7b',
         'title': 'Training Loss Curve of OLMo-7B',
-        'zoom_range': (2700, 2750),  # Zoom x-axis range for inset
+        'zoom_range': (3750, 3800),  # Zoom x-axis range for inset
         'file_configs': [
             ('OLMo-7B-reproduce.txt', 'BF16', 'green', '-'),
-            ('FakeQuant-Activation-OLMo-7B-MXFP-4-auto-reverse.txt', 'Four Over Six', 'red', '-'),
-            ('FakeQuant-Activation-OLMo-7B-MXFP-4.txt', 'COAT*', 'yellow', '-'),
-            ('FakeQuant-Activation-OLMo-7B-MXFP-4-Minus-auto.txt', 'Half-S', 'blue', '-'),
-            # ('FakeQuant-Activation-OLMo-7B-MXFP-4-Minus1.txt', 'Fixed Half-S', 'orange', '-'),
-            # ('FakeQuant-Activation-OLMo-7B-MXFP-4-Minus2.txt', 'Fixed S/4', 'purple', '-'),
-            # ('FakeQuant-Activation-OLMo-7B-MXFP-4-Minus-auto-2.txt', 'Mixed (S + S/4)', 'brown', '-'),
+            ('FakeQuant-Activation-OLMo-7B-MXFP-4-auto-reverse-5000.txt', 'Four Over Six', 'red', '-'),
+            ('FakeQuant-Activation-OLMo-7B-MXFP-4-5000.txt', 'COAT*', 'yellow', '-'),
+            ('FakeQuant-Activation-OLMo-7B-MXFP-4-Minus-auto-5000.txt', 'Half-S', 'blue', '-'),
+            ('FakeQuant-Activation-OLMo-7B-MXFP-4-Minus-auto-fix.txt', 'Half-S(sigma)', 'purple', '-'),
+            ('FakeQuant-Activation-OLMo-7B-MXFP-4-Minus1-5000.txt', 'Fixed Half-S', 'orange', '-'),
+            # ('FakeQuant-Activation-OLMo-7B-MXFP-4-Minus2-5000.txt', 'Fixed S/4', 'purple', '-'),
+            # ('FakeQuant-Activation-OLMo-7B-MXFP-4-Minus-auto-2-5000.txt', 'Mixed (S + S/4)', 'brown', '-'),
         ]
     },
     'OLMo-1B': {
         'data_dir': 'logs/OLMo-1b',
         'output_dir': 'logs/OLMo-1b',
         'title': 'Training Loss Curve of OLMo-1B',
-        'zoom_range': (1750, 1800),  # Zoom x-axis range for inset
+        'zoom_range': (4750, 4800),  # Zoom x-axis range for inset
         'file_configs': [
-            ('OLMo-1B-reproduce.txt', 'BF16', 'green', '-'),
-            # ('FakeQuant-Activation-OLMo-1B-MXFP-4-auto-reverse.txt', 'Four Over Six', 'red', '-'),
-            # ('FakeQuant-Activation-OLMo-1B-MXFP-4.txt', 'COAT*', 'yellow', '-'),
-            # ('FakeQuant-Activation-OLMo-1B-MXFP-4.txt', 'mxfp4 (Linear)', 'yellow', '-'),
-            ('FakeQuant-Activation-OLMo-1B-MXFP-4-attn.txt', 'COAT* (A+L)', 'brown', '-'),
-            # ('FakeQuant-Activation-OLMo-1B-MXFP-4-auto.txt', 'Half-S', 'blue', '-'),
-            # ('FakeQuant-Activation-OLMo-1B-MXFP-4-auto.txt', 'Half-S (Linear)', 'blue', '-'),
-            ('FakeQuant-Activation-OLMo-1B-MXFP-4-auto-attn.txt', 'Half-S (A+L)', 'purple', '-'),
+            ('OLMo-1B-reproduce-5000.txt', 'BF16', 'green', '-'),
+            ('FakeQuant-Activation-OLMo-1B-MXFP-4-auto-reverse-5000.txt', 'Four Over Six', 'red', '-'),
+            ('FakeQuant-Activation-OLMo-1B-MXFP-4-5000.txt', 'COAT*', 'yellow', '-'),
+            # ('FakeQuant-Activation-OLMo-1B-MXFP-4-5000.txt', 'mxfp4 (Linear)', 'yellow', '-'),
+            # ('FakeQuant-Activation-OLMo-1B-MXFP-4-attn-5000.txt', 'COAT* (A+L)', 'brown', '-'),
+            ('FakeQuant-Activation-OLMo-1B-MXFP-4-auto-5000.txt', 'Half-S', 'blue', '-'),
+            # ('FakeQuant-Activation-OLMo-1B-MXFP-4-auto-5000.txt', 'Half-S (Linear)', 'blue', '-'),
+            # ('FakeQuant-Activation-OLMo-1B-MXFP-4-auto-attn-5000.txt', 'Half-S (A+L)', 'purple', '-'),
         ]
     },
 }
@@ -224,7 +225,7 @@ def main():
             })
 
     ax.set_xlim(start_step, end_step)
-    ax.xaxis.set_major_locator(MultipleLocator(500))
+    ax.xaxis.set_major_locator(MultipleLocator(1000))
     ax.yaxis.set_minor_locator(AutoMinorLocator(5))
     # ax.set_title(f'{PLOT_TITLE}', fontsize=10, fontweight='bold')
     ax.set_xlabel('Step', fontsize=9)
