@@ -4,12 +4,12 @@ from .ops.hifp import quant_hif8
 from .ops.nvfp import quant_nvfp
 import os
 
-# --- 全局配置 ---
+# --- 全局配置：tensor 保存 hook，用于调试。ENABLE 建议由训练脚本从 config.quantize_model.debug_save_tensors 同步 ---
 class DebugSaverConfig:
-    ENABLE = True                  # 总开关
-    CURRENT_ITER = 0               # 当前 iter (需要在训练循环里手动更新)
-    TARGET_ITERS = [501,701,1001]        # 需要保存的 iter
-    SAVE_DIR = "./newtensors_Olmo7B"   # 相对路径
+    ENABLE = False                 # 总开关，由 config 中 debug_save_tensors 控制
+    CURRENT_ITER = 0               # 当前 iter (在训练循环里由 Trainer 更新)
+    TARGET_ITERS = [501, 701, 1001]# 需要保存的 iter
+    SAVE_DIR = "./newtensors_Olmo7B"
     SAVE_COUNTER = 0
     MIN_SIZE_MB = 7
 
@@ -72,7 +72,7 @@ def _convert_format_to_internal(forward_format):
 
 class QuantDequantTensorWithBackward(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, tensor, forward_format='mxfp8_e4m3', minus_exp=None, 
+    def forward(ctx, tensor, forward_format='mxfp8_e4m3', forward_minus_exp=None, backward_minus_exp=None,
                 backward_quantize=True, backward_format='mxfp8_e4m3', name=None):
 
         if tensor.requires_grad: 
@@ -80,7 +80,7 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
 
         scale_bits = 8
         tensor_temp = tensor.clone()   
-        # Forward 量化
+        # Forward 量化（使用 forward_minus_exp）
         if forward_format in ['mxfp8_e4m3', 'mxfp8_e5m2','mxfp4_e2m1']:
             # Convert format name from external API to internal format
             internal_format = _convert_format_to_internal(forward_format)
@@ -94,7 +94,7 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
                 block_size=32 if forward_format in ['mxfp8_e4m3', 'mxfp8_e5m2'] else 16,
                 round="nearest",
                 flush_fp32_subnorms=False,
-                minus_exp=minus_exp
+                minus_exp=forward_minus_exp
             )
         elif forward_format in ['hif8']:
             tensor_temp = quant_hif8(tensor_temp.detach())
@@ -105,10 +105,10 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
         else:
             raise ValueError(f"Unsupported forward format: {forward_format}")
         
-        # 保存参数用于 backward
+        # 保存参数用于 backward（backward 使用 backward_minus_exp）
         ctx.backward_quantize = backward_quantize
         ctx.backward_format = backward_format 
-        ctx.minus_exp = minus_exp
+        ctx.backward_minus_exp = backward_minus_exp
         ctx.name = name # 保存 name
         
         # STE: 允许梯度流回原 tensor，但使用量化后的值进行计算
@@ -137,7 +137,7 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
                     block_size=32 if ctx.backward_format in ['mxfp8_e4m3', 'mxfp8_e5m2'] else 16,
                     round="nearest",
                     flush_fp32_subnorms=False,
-                    minus_exp=ctx.minus_exp
+                    minus_exp=ctx.backward_minus_exp
                 )
             elif ctx.backward_format in ['hif8']:
                 grad_temp = quant_hif8(grad_temp.detach())
@@ -150,53 +150,65 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
             # STE: 允许梯度继续传播，但使用量化后的值
             grad_input = grad_output + (grad_temp - grad_output.detach())
             
-            return grad_input, None, None, None, None, None
+            return grad_input, None, None, None, None, None, None
         else:
             # 不量化梯度，直接返回
-            return grad_output, None, None, None, None, None
+            return grad_output, None, None, None, None, None, None
 
 
-# 恢复原样，不需要 name 参数
 def quant_dequant_tensor_with_backward(tensor, forward_format='mxfp8_e4m3', 
-                                       minus_exp=None, 
+                                       minus_exp=None,
+                                       forward_minus_exp=None,
+                                       backward_minus_exp=None,
                                        backward_quantize=True,
-                                       backward_format='mxfp8_e4m3'):
+                                       backward_format='mxfp8_e4m3',
+                                       name=None):
+    """
+    Fake quantize-dequantize with optional backward quantization.
+    minus_exp: 若未指定 forward_minus_exp/backward_minus_exp 则同时用于 forward 与 backward（兼容旧接口）。
+    forward_minus_exp: 仅用于前向量化的 exponent 偏移。
+    backward_minus_exp: 仅用于反向量化的 exponent 偏移。
+    """
+    fwd_me = forward_minus_exp if forward_minus_exp is not None else minus_exp
+    bwd_me = backward_minus_exp if backward_minus_exp is not None else minus_exp
     return QuantDequantTensorWithBackward.apply(
-        tensor, forward_format, minus_exp, backward_quantize, backward_format
+        tensor, forward_format, fwd_me, bwd_me, backward_quantize, backward_format, name
     )
 
-# 恢复原样，不需要 name 参数
-def quant_dequant_qkv(q,k,v,minus_exp=None, forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3'):
-    q = quant_dequant_tensor_with_backward(q, forward_format, minus_exp, backward_quantize, backward_format)
-    k = quant_dequant_tensor_with_backward(k, forward_format, minus_exp, backward_quantize, backward_format)
-    v = quant_dequant_tensor_with_backward(v, forward_format, minus_exp, backward_quantize, backward_format)
-    
+
+def quant_dequant_qkv(q, k, v, minus_exp=None, forward_minus_exp=None, backward_minus_exp=None,
+                      forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3'):
+    q = quant_dequant_tensor_with_backward(
+        q, forward_format, minus_exp, forward_minus_exp, backward_minus_exp,
+        backward_quantize, backward_format
+    )
+    k = quant_dequant_tensor_with_backward(
+        k, forward_format, minus_exp, forward_minus_exp, backward_minus_exp,
+        backward_quantize, backward_format
+    )
+    v = quant_dequant_tensor_with_backward(
+        v, forward_format, minus_exp, forward_minus_exp, backward_minus_exp,
+        backward_quantize, backward_format
+    )
     q = q.to(torch.bfloat16)
     k = k.to(torch.bfloat16)
     v = v.to(torch.bfloat16)
-    return q,k,v
-
-def quant_dequant_tensor_with_backward(tensor, forward_format='mxfp8_e4m3', 
-                                       minus_exp=None, 
-                                       backward_quantize=True,
-                                       backward_format='mxfp8_e4m3',
-                                       name=None): # 新增 name
-    return QuantDequantTensorWithBackward.apply(
-        tensor, forward_format, minus_exp, backward_quantize, backward_format, name
-    )
+    return q, k, v
 
 def quant_matmul(A, B, forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3', name_prefix=None,minus_exp=None):
-    
     name_A = f"{name_prefix}_A" if name_prefix else None
     name_B = f"{name_prefix}_B" if name_prefix else None
-
-    # 调用带 name 的版本
-    A = quant_dequant_tensor_with_backward(A, forward_format, minus_exp, backward_quantize, backward_format, name=name_A)
-    B = quant_dequant_tensor_with_backward(B, forward_format, minus_exp, backward_quantize, backward_format, name=name_B)
+    A = quant_dequant_tensor_with_backward(
+        A, forward_format, None, None, None, backward_quantize, backward_format, name=name_A
+    )
+    B = quant_dequant_tensor_with_backward(
+        B, forward_format, None, None, None, backward_quantize, backward_format, name=name_B
+    )
     return torch.matmul(A, B)
 
-def quant_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3'):
-    input = quant_dequant_tensor_with_backward(input, forward_format, None, backward_quantize, backward_format)
-    batch1 = quant_dequant_tensor_with_backward(batch1, forward_format, None, backward_quantize, backward_format)
-    batch2 = quant_dequant_tensor_with_backward(batch2, forward_format, None, backward_quantize, backward_format)
+
+def quant_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0, forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3'):
+    input = quant_dequant_tensor_with_backward(input, forward_format, None, None, None, backward_quantize, backward_format)
+    batch1 = quant_dequant_tensor_with_backward(batch1, forward_format, None, None, None, backward_quantize, backward_format)
+    batch2 = quant_dequant_tensor_with_backward(batch2, forward_format, None, None, None, backward_quantize, backward_format)
     return torch.baddbmm(input, batch1, batch2, beta=beta, alpha=alpha)
