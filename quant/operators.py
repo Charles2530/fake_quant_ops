@@ -185,14 +185,14 @@ def quant_dequant_tensor_with_backward(tensor, forward_format='mxfp8_e4m3',
         tensor, forward_format, minus_exp, backward_quantize, backward_format, name
     )
 
-def quant_matmul(A, B, forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3', name_prefix=None):
+def quant_matmul(A, B, forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3', name_prefix=None,minus_exp=None):
     
     name_A = f"{name_prefix}_A" if name_prefix else None
     name_B = f"{name_prefix}_B" if name_prefix else None
 
     # 调用带 name 的版本
-    A = quant_dequant_tensor_with_backward(A, forward_format, None, backward_quantize, backward_format, name=name_A)
-    B = quant_dequant_tensor_with_backward(B, forward_format, None, backward_quantize, backward_format, name=name_B)
+    A = quant_dequant_tensor_with_backward(A, forward_format, minus_exp, backward_quantize, backward_format, name=name_A)
+    B = quant_dequant_tensor_with_backward(B, forward_format, minus_exp, backward_quantize, backward_format, name=name_B)
     return torch.matmul(A, B)
 
 def quant_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3'):

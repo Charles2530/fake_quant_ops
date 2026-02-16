@@ -4,37 +4,37 @@ import sys,os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.quant_compute.quant_cy_npu.quant_cy_npu import quant_dequant_float,QType
 
-def quant_dequant_qkv(q,k,v):
+def quant_dequant_qkv(q,k,v,custom_quant_type='mxfp8e4m3'):
     q_temp,k_temp,v_temp = q.clone(),k.clone(),v.clone()
     q_temp = quant_dequant_float(
         q_temp.detach(),
-        QType('mxfp8e4m3'),
+        QType(custom_quant_type),
     )
     k_temp = quant_dequant_float(
         k_temp.detach(),
-        QType('mxfp8e4m3'),
+        QType(custom_quant_type),
     )
     v_temp = quant_dequant_float(
         v_temp.detach(),
-        QType('mxfp8e4m3'),
+        QType(custom_quant_type),
     )
     final_q = q + (q_temp - q.detach())
     final_k = k + (k_temp - k.detach())
     final_v = v + (v_temp - v.detach())
     return final_q,final_k,final_v
     
-def quant_dequant_tensor(tensor):
+def quant_dequant_tensor(tensor,custom_quant_type='mxfp8e4m3'):
     tensor_temp = tensor.clone()
     tensor_temp = quant_dequant_float(
         tensor_temp.detach(),
-        QType('mxfp8e4m3'),
+        QType(custom_quant_type),
     )
     final_tensor = tensor + (tensor_temp - tensor.detach())
     return final_tensor
 
-def mxfp_matmul(A,B):
-    qtype_a = QType('mxfp8e4m3')
-    qtype_b = QType('mxfp8e4m3')
+def mxfp_matmul(A,B,custom_quant_type='mxfp8e4m3'):
+    qtype_a = QType(custom_quant_type)
+    qtype_b = QType(custom_quant_type)
     qtype_a.dim_(-1)
     qtype_b.dim_(0)
     newA = quant_dequant_float(A.clone(), qtype_a, force_py=False)
