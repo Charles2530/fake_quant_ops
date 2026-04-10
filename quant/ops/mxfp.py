@@ -286,7 +286,7 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
                         except:
                             # If view fails, try broadcast_to
                             minus_exp_result = torch.broadcast_to(minus_exp_result, shared_exp.shape).clone()
-                minus_exp = minus_exp_result
+                minus_exp = minus_exp_result.to(shared_exp.dtype)
             else:
                 # Scalar value, create tensor with shared_exp shape
                 minus_exp = torch.full(shared_exp.shape, minus_exp_result, dtype=shared_exp.dtype, device=shared_exp.device)
@@ -431,7 +431,7 @@ def _quantize_mx(
     if block_size > 0:
         A_q = _undo_reshape_to_blocks(A_q, padded_shape, orig_shape, axes)
 
-    return A_q
+    return A_q.to(A.dtype)
 import torch
 from torch.autograd import Function
 
@@ -624,7 +624,7 @@ def calculate_minus_mse_exp(
         
         best_minus_exp_per_block = torch.where(
             better_is_half,
-            torch.full_like(shared_exp, minus_level, dtype=torch.float),
+            torch.full_like(shared_exp, minus_level, dtype=shared_exp.dtype),
             torch.zeros_like(shared_exp)
         )
     else:
@@ -756,7 +756,7 @@ def calculate_minus_mse_exp_sigma(
         
         best_minus_exp_per_block = torch.where(
             use_half,
-            torch.full_like(shared_exp, minus_level, dtype=torch.float),
+            torch.full_like(shared_exp, minus_level, dtype=shared_exp.dtype),
             torch.zeros_like(shared_exp)
         )
     else:

@@ -199,7 +199,7 @@ def quant_dequant_qkv(q, k, v, minus_exp=None, forward_minus_exp=None, backward_
     v = v.to(torch.bfloat16)
     return q, k, v
 
-def quant_matmul(A, B, forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3', name_prefix=None):
+def quant_matmul(A, B, forward_format='mxfp8_e4m3', backward_quantize=True, backward_format='mxfp8_e4m3', name_prefix=None,minus_exp=None):
     name_A = f"{name_prefix}_A" if name_prefix else None
     name_B = f"{name_prefix}_B" if name_prefix else None
     A = quant_dequant_tensor_with_backward(
