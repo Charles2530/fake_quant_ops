@@ -99,7 +99,9 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
         elif forward_format in ['hif8']:
             tensor_temp = quant_hif8(tensor_temp.detach())
         elif forward_format in ['nvfp8_e4m3', 'nvfp8_e5m2','nvfp4_e2m1']:
-            tensor_temp = quant_nvfp(tensor_temp.detach(), forward_format)
+            # tensor_temp = quant_nvfp(tensor_temp.detach(), forward_format)
+            from .nvfp4 import quant_nvfp4
+            tensor_temp = quant_nvfp4(tensor_temp.detach())
         elif forward_format in ['bf16']:
             tensor_temp = tensor_temp.to(torch.bfloat16)
         else:
@@ -142,7 +144,9 @@ class QuantDequantTensorWithBackward(torch.autograd.Function):
             elif ctx.backward_format in ['hif8']:
                 grad_temp = quant_hif8(grad_temp.detach())
             elif ctx.backward_format in ['nvfp8_e4m3', 'nvfp8_e5m2','nvfp4_e2m1']:
-                grad_temp = quant_nvfp(grad_temp.detach(), ctx.backward_format)
+                # grad_temp = quant_nvfp(grad_temp.detach(), ctx.backward_format)
+                from .nvfp4 import quant_nvfp4
+                grad_temp = quant_nvfp4(grad_temp.detach())
             elif ctx.backward_format in ['bf16']:
                 grad_temp = grad_temp.to(torch.bfloat16)
             else:

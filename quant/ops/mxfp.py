@@ -879,6 +879,19 @@ def calculate_minus_exp(
 
 
 if __name__ == '__main__':
+    input_data = torch.randn((1024, 1024), dtype=torch.bfloat16)
+
+    # 执行 QDQ
+    output_data = _quantize_mx(input_data, scale_bits=8, elem_format='fp4_e2m1', shared_exp_method="max", axes=-1,
+                                   block_size=32, round="nearest", flush_fp32_subnorms=False,
+                                   minus_exp=None, heuristic_level=None)
+
+    print(f"原始形状: {input_data.shape}")
+
+    # 计算误差
+    mse = torch.mean((input_data - output_data)**2)
+    print(f"量化均方误差 (MSE): {mse:.6f}")
+    pass
     A = torch.load("data/bf16/20250923_100142_0001_iter000_linear_L1_forward_pre_linear_bf16_rank00_group000_input.pt", map_location='cpu')['tensor'].cuda()
     B = torch.load("data/bf16/20250923_100142_0002_iter000_linear_L1_forward_pre_linear_bf16_rank00_group000_weight.pt", map_location='cpu')['tensor'].cuda() 
     # Test different minus_exp settings including 'auto' with different heuristic levels
