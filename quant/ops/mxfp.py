@@ -240,64 +240,51 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
         raise Exception("Unrecognized shared exponent selection method %s" % (method))
 
     # log2(shared_exp) and truncate to integer
-    if minus_exp is not None:
-        shared_exp = torch.ceil(
-            torch.log2(
-                shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
-            )
+    # shared_exp = torch.ceil(
+    shared_exp = torch.floor(
+        torch.log2(
+            shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
         )
-        if isinstance(minus_exp, str) and "auto" in minus_exp:
-            if minus_exp == "auto":     
-                minus_exp_result = calculate_minus_mse_exp(
-                    A, scale_bits=8, elem_format=elem_format, 
-                    shared_exp_method=method, axes=axes, block_size=32, 
-                    round="nearest", flush_fp32_subnorms=False,minus_level=minus_level
-                )
-            elif minus_exp == "auto-fix":
-                minus_exp_result = calculate_minus_mse_exp_sigma(
-                    A, scale_bits=8, elem_format=elem_format, 
-                    shared_exp_method=method, axes=axes, block_size=32, 
-                    round="nearest", flush_fp32_subnorms=False,minus_level=minus_level
-                )
-            elif minus_exp == "auto-reverse":
-                minus_exp_result = calculate_minus_mse_exp(
-                    A, scale_bits=8, elem_format=elem_format, 
-                    shared_exp_method=method, axes=axes, block_size=32, 
-                    round="nearest", flush_fp32_subnorms=False, minus_level=-1.0
-                )
-            elif minus_exp == "auto-2":
-                minus_exp_result = calculate_minus_mse_exp(
-                    A, scale_bits=8, elem_format=elem_format, 
-                    shared_exp_method=method, axes=axes, block_size=32, 
-                    round="nearest", flush_fp32_subnorms=False, minus_level=2.0
-                )
-            # Ensure minus_exp has the same shape as shared_exp
-            if isinstance(minus_exp_result, torch.Tensor):
-                # If shapes don't match, try to reshape
+    )
+    if isinstance(minus_exp, str) and "auto" in minus_exp:
+        if minus_exp == "auto":     
+            minus_exp_result = calculate_minus_mse_exp(
+                A, scale_bits=8, elem_format=elem_format, 
+                shared_exp_method=method, axes=axes, block_size=32, 
+                round="nearest", flush_fp32_subnorms=False,minus_level=minus_level
+            )
+        elif minus_exp == "auto-reverse":
+            minus_exp_result = calculate_minus_mse_exp(
+                A, scale_bits=8, elem_format=elem_format, 
+                shared_exp_method=method, axes=axes, block_size=32, 
+                round="nearest", flush_fp32_subnorms=False, minus_level=-1.0
+            )
+        elif minus_exp == "auto-2":
+            minus_exp_result = calculate_minus_mse_exp(
+                A, scale_bits=8, elem_format=elem_format, 
+                shared_exp_method=method, axes=axes, block_size=32, 
+                round="nearest", flush_fp32_subnorms=False, minus_level=2.0
+            )
+        # Ensure minus_exp has the same shape as shared_exp
+        if isinstance(minus_exp_result, torch.Tensor):
+            # If shapes don't match, try to reshape
+            if minus_exp_result.shape != shared_exp.shape:
+                # Try to squeeze extra trailing dimensions of size 1
+                while (minus_exp_result.ndim > shared_exp.ndim and 
+                    minus_exp_result.shape[-1] == 1):
+                    minus_exp_result = minus_exp_result.squeeze(-1)
+                # If still don't match, try to view or broadcast
                 if minus_exp_result.shape != shared_exp.shape:
-                    # Try to squeeze extra trailing dimensions of size 1
-                    while (minus_exp_result.ndim > shared_exp.ndim and 
-                        minus_exp_result.shape[-1] == 1):
-                        minus_exp_result = minus_exp_result.squeeze(-1)
-                    # If still don't match, try to view or broadcast
-                    if minus_exp_result.shape != shared_exp.shape:
-                        try:
-                            minus_exp_result = minus_exp_result.view(shared_exp.shape)
-                        except:
-                            # If view fails, try broadcast_to
-                            minus_exp_result = torch.broadcast_to(minus_exp_result, shared_exp.shape).clone()
-                minus_exp = minus_exp_result.to(shared_exp.dtype)
-            else:
-                # Scalar value, create tensor with shared_exp shape
-                minus_exp = torch.full(shared_exp.shape, minus_exp_result, dtype=shared_exp.dtype, device=shared_exp.device)
-            # print(f"minus_exp is auto, calculated per-block with heuristic level {heuristic_level}.")
-        shared_exp = shared_exp - minus_exp
-    else:
-        shared_exp = torch.floor(
-            torch.log2(
-                shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
-            )
-        )
+                    try:
+                        minus_exp_result = minus_exp_result.view(shared_exp.shape)
+                    except:
+                        # If view fails, try broadcast_to
+                        minus_exp_result = torch.broadcast_to(minus_exp_result, shared_exp.shape).clone()
+            minus_exp = minus_exp_result.to(shared_exp.dtype)
+        else:
+            # Scalar value, create tensor with shared_exp shape
+            minus_exp = torch.full(shared_exp.shape, minus_exp_result, dtype=shared_exp.dtype, device=shared_exp.device)
+    shared_exp = shared_exp - minus_exp
 
     # Restrict to [-emax, emax] range
     if ebits > 0:
