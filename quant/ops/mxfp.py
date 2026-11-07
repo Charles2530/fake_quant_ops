@@ -213,7 +213,8 @@ def _quantize_elemwise_core(A, bits, exp_bits, max_norm, round='nearest',
                 requires_grad=sparse_A.requires_grad)
     return out
 
-def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2', minus_exp=None,minus_level=1.0, heuristic_level=None):
+def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2', minus_exp=None,minus_level=1.0, heuristic_level=None,
+                      block_size=0, scale_bits=8, round="nearest", flush_fp32_subnorms=False):
     """
     Get shared exponents for the passed matrix A.
     Args:
@@ -239,52 +240,30 @@ def _shared_exponents(A, method="max", axes=None, ebits=0, elem_format='fp8_e5m2
     else:
         raise Exception("Unrecognized shared exponent selection method %s" % (method))
 
-    # log2(shared_exp) and truncate to integer
-    # shared_exp = torch.ceil(
+    # Use the same floor-based reference scale for fixed and auto modes.
     shared_exp = torch.floor(
         torch.log2(
             shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
         )
     )
-    if isinstance(minus_exp, str) and "auto" in minus_exp:
-        if minus_exp == "auto":     
-            minus_exp_result = calculate_minus_mse_exp(
-                A, scale_bits=8, elem_format=elem_format, 
-                shared_exp_method=method, axes=axes, block_size=32, 
-                round="nearest", flush_fp32_subnorms=False,minus_level=minus_level
-            )
-        elif minus_exp == "auto-reverse":
-            minus_exp_result = calculate_minus_mse_exp(
-                A, scale_bits=8, elem_format=elem_format, 
-                shared_exp_method=method, axes=axes, block_size=32, 
-                round="nearest", flush_fp32_subnorms=False, minus_level=-1.0
-            )
-        elif minus_exp == "auto-2":
-            minus_exp_result = calculate_minus_mse_exp(
-                A, scale_bits=8, elem_format=elem_format, 
-                shared_exp_method=method, axes=axes, block_size=32, 
-                round="nearest", flush_fp32_subnorms=False, minus_level=2.0
-            )
-        # Ensure minus_exp has the same shape as shared_exp
-        if isinstance(minus_exp_result, torch.Tensor):
-            # If shapes don't match, try to reshape
-            if minus_exp_result.shape != shared_exp.shape:
-                # Try to squeeze extra trailing dimensions of size 1
-                while (minus_exp_result.ndim > shared_exp.ndim and 
-                    minus_exp_result.shape[-1] == 1):
-                    minus_exp_result = minus_exp_result.squeeze(-1)
-                # If still don't match, try to view or broadcast
-                if minus_exp_result.shape != shared_exp.shape:
-                    try:
-                        minus_exp_result = minus_exp_result.view(shared_exp.shape)
-                    except:
-                        # If view fails, try broadcast_to
-                        minus_exp_result = torch.broadcast_to(minus_exp_result, shared_exp.shape).clone()
-            minus_exp = minus_exp_result.to(shared_exp.dtype)
-        else:
-            # Scalar value, create tensor with shared_exp shape
-            minus_exp = torch.full(shared_exp.shape, minus_exp_result, dtype=shared_exp.dtype, device=shared_exp.device)
-    shared_exp = shared_exp - minus_exp
+    if isinstance(minus_exp, str):
+        options = {"auto": (calculate_minus_mse_exp, minus_level),
+                   "auto-fix": (calculate_minus_mse_exp_sigma, minus_level),
+                   "auto-reverse": (calculate_minus_mse_exp, -1.0),
+                   "auto-2": (calculate_minus_mse_exp, 2.0)}
+        if minus_exp not in options:
+            raise ValueError(f"Unknown minus_exp mode: {minus_exp}")
+        selector, level = options[minus_exp]
+        minus_exp = selector(
+            A, scale_bits=scale_bits, elem_format=elem_format,
+            shared_exp_method=method, axes=axes, block_size=block_size,
+            round=round, flush_fp32_subnorms=flush_fp32_subnorms,
+            minus_level=level, preblocked=block_size > 0,
+        )
+        if isinstance(minus_exp, torch.Tensor) and minus_exp.shape != shared_exp.shape:
+            raise ValueError("Auto minus_exp shape does not match shared exponents")
+    if minus_exp is not None:
+        shared_exp = shared_exp - minus_exp
 
     # Restrict to [-emax, emax] range
     if ebits > 0:
@@ -398,6 +377,8 @@ def _quantize_mx(
     shared_exp = _shared_exponents(
         A_reshaped, method=shared_exp_method, axes=shared_exp_axes, ebits=0,elem_format=elem_format, 
         minus_exp=minus_exp, minus_level=minus_level, heuristic_level=heuristic_level,
+        block_size=block_size, scale_bits=scale_bits, round=round,
+        flush_fp32_subnorms=flush_fp32_subnorms,
     )
 
     if flush_fp32_subnorms:
@@ -490,6 +471,7 @@ def calculate_minus_mse_exp(
     round="nearest",
     flush_fp32_subnorms=False,
     minus_level:float=1.0,
+    preblocked=False,
 ):
     if elem_format == None:
         # If no quantization format, return 0 (no minus_exp adjustment needed)
@@ -506,7 +488,10 @@ def calculate_minus_mse_exp(
     
     # Check if axes are valid for current A shape
     # If axes contain values >= A.ndim, it means A is already reshaped and axes are already adjusted
-    if block_size > 0 and axes:
+    if preblocked:
+        A_reshaped = A
+        shared_exp_axes = axes
+    elif block_size > 0 and axes:
         axes_valid = all(0 <= ax < A.ndim for ax in axes)
         if axes_valid:
             # A is not reshaped yet, do reshape
@@ -635,6 +620,7 @@ def calculate_minus_mse_exp_sigma(
     round="nearest",
     flush_fp32_subnorms=False,
     minus_level:float=1.0,
+    preblocked=False,
 ):
     """
     Calculate minus_exp based on max value comparison with 4.14*sigma.
@@ -670,7 +656,10 @@ def calculate_minus_mse_exp_sigma(
     
     # Check if axes are valid for current A shape
     # If axes contain values >= A.ndim, it means A is already reshaped and axes are already adjusted
-    if block_size > 0 and axes:
+    if preblocked:
+        A_reshaped = A
+        shared_exp_axes = axes
+    elif block_size > 0 and axes:
         axes_valid = all(0 <= ax < A.ndim for ax in axes)
         if axes_valid:
             # A is not reshaped yet, do reshape
